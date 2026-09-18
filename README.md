@@ -287,6 +287,20 @@ scripts/smoke.sh      https://<your-worker> "$INGEST_KEY"
 scripts/edge-cases.sh https://<your-worker> "$INGEST_KEY"
 ```
 
+Two more, aimed at the cases that only break at the edges:
+
+```sh
+scripts/seq-unit.sh                                  # offline, ~1s
+scripts/cache-boundary.sh https://<host> "$INGEST_KEY"
+```
+
+`seq-unit.sh` pins the playlist rewriting: a restarting encoder renumbers from
+zero, and a live EXT-X-MEDIA-SEQUENCE that decreases stalls players.
+`cache-boundary.sh` drives the real Cloudflare edge, because the staleness it
+hunts is edge behaviour — a cached playlist freezing the stream, a cached
+slate hiding a broadcast that already started, a returning viewer handed
+segments that no longer exist.
+
 ## Offline behaviour
 
 A stream with no live content serves a playable "OFFLINE / WAITING FOR STREAM"

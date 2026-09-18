@@ -1,9 +1,9 @@
 # KRSZ Live on a VPS
 
 > Deployed and verified on Oracle Linux 9.7 (1 core, 1 GB) behind a Cloudflare
-> tunnel. Ingest and playback both work end to end. One thing still needs doing
-> by hand: the Cache Rule in the section below — without it every viewer
-> request reaches the box.
+> tunnel. Ingest and playback work end to end, the Cache Rule is in place, and
+> `scripts/cache-boundary.sh` passes 20/20 against the live host — segments
+> report `HIT` while playlists stay uncached.
 
 ## What actually runs
 
