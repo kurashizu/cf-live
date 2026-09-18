@@ -276,6 +276,37 @@ else
   skip=$((skip+1))
 fi
 
+sec "9c. Starting a broadcast purges the cached OFFLINE playlist"
+# Regression: the offline playlist is edge-cached, so without an explicit purge
+# on ingest, viewers were served OFFLINE for the full TTL after a broadcast had
+# already started — measured at 9s while the DO already held live segments.
+RS="purge$$"
+curl -fsS "$BASE/$RS" >/dev/null 2>&1          # prime the cache
+publish "$RS" 30 2 60
+SEEN_LIVE=-1
+for t in $(seq 0 14); do
+  DO_SEGS=$(curl -fsS "$BASE/status/$RS" 2>/dev/null \
+            | grep -o '"segmentsBuffered":[0-9]*' | cut -d: -f2)
+  if ! curl -fsS "$BASE/$RS" 2>/dev/null | grep -q '_offline'; then
+    SEEN_LIVE=$t
+    break
+  fi
+  # Record when the DO first had content, to measure the cache's contribution.
+  [ "${DO_SEGS:-0}" -ge 1 ] && [ "${DO_FIRST:-}" = "" ] && DO_FIRST=$t
+  sleep 1
+done
+if [ "$SEEN_LIVE" -lt 0 ]; then
+  bad "viewers still see OFFLINE 14s after the broadcast started"
+else
+  LAG=$(( SEEN_LIVE - ${DO_FIRST:-$SEEN_LIVE} ))
+  [ "$LAG" -lt 0 ] && LAG=0
+  if [ "$LAG" -le 4 ]; then
+    ok "live playlist reached viewers ${LAG}s after ingest began"
+  else
+    bad "stale OFFLINE served for ${LAG}s after ingest began"
+  fi
+fi
+
 sec "10. Unknown and malformed playback requests"
 [ "$(code "$BASE/live/live1/seg99999999.ts")" = "404" ] \
   && ok "missing segment → 404" || bad "missing segment wrong status"

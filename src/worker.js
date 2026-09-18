@@ -54,7 +54,18 @@ export default {
         if (!safeEqual(key, env.INGEST_KEY)) return text('forbidden', 403);
         if (!isSafeName(stream) || !isSafeName(file)) return text('bad name', 400);
 
-        return roomFetch(env, stream, request, `/ingest/${encodeURIComponent(file)}`);
+        const ingested = await roomFetch(
+          env, stream, request, `/ingest/${encodeURIComponent(file)}`);
+        // A live segment just arrived, so any cached OFFLINE playlist for this
+        // stream is now wrong. Purge it rather than waiting out its TTL, which
+        // otherwise leaves viewers on the slate for seconds after the
+        // broadcast has actually started.
+        if (ingested.status === 200 && request.method === 'PUT'
+            && !file.endsWith('.m3u8')) {
+          const purge = caches.default.delete(offlineCacheKey(request, stream));
+          if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(purge);
+        }
+        return ingested;
       }
 
       // ---- playback --------------------------------------------------------
@@ -173,7 +184,11 @@ async function serveSegment(env, stream, file, request, ctx) {
  */
 async function servePlaylist(env, stream, request, ctx) {
   const cache = caches.default;
-  const cacheKey = new Request(new URL(request.url).toString(), { method: 'GET' });
+  // Cache the offline playlist under a key the ingest path can also compute,
+  // so starting a broadcast can purge it. Keyed off the stream name only, not
+  // the request URL, because the same playlist is reachable from three paths
+  // (/s, /s.m3u8, /live/s.m3u8) and all three must be invalidated together.
+  const cacheKey = offlineCacheKey(request, stream);
 
   const hit = await cache.match(cacheKey);
   if (hit) return hit;
@@ -191,6 +206,21 @@ async function servePlaylist(env, stream, request, ctx) {
     return cached;
   }
   return res;
+}
+
+/**
+ * Cache key for a stream's offline playlist.
+ *
+ * Shared by the playback and ingest paths so that the first segment of a new
+ * broadcast can delete the entry. Without that purge, viewers keep being
+ * served OFFLINE from the edge for the full cache lifetime even though the
+ * Durable Object already has live segments.
+ */
+function offlineCacheKey(request, stream) {
+  const url = new URL(request.url);
+  url.pathname = `/__offline/${encodeURIComponent(stream)}`;
+  url.search = '';
+  return new Request(url.toString(), { method: 'GET' });
 }
 
 /** Route a request to the DO that owns this stream. */

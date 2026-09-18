@@ -272,6 +272,8 @@ is cached for `OFFLINE_CACHE_TTL` seconds and the status poll backs off from 2s
 toward 30s while offline (pausing entirely on a hidden tab), which measured at
 ~90% edge-hit rate in production.
 
-The trade-off is that a viewer may keep seeing the slate for up to
-`OFFLINE_CACHE_TTL` seconds after a broadcast actually starts. Lower it for a
-faster start, raise it to spend less quota.
+Ingest purges the cached offline playlist as soon as the first live segment
+arrives, so viewers do not sit on the slate waiting out its TTL. Cloudflare's
+cache is per-colo and the purge only runs where the ingest request landed, so
+`OFFLINE_CACHE_TTL` (3s) remains the worst case for viewers in other regions.
+Raise it to spend less quota, at the cost of a slower-looking start.
