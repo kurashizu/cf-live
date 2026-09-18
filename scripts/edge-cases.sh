@@ -431,6 +431,8 @@ sec "12. Encoder restart (discontinuity)"
 # numbering reset — exactly what stopping and restarting OBS does.
 pkill -f "ingest/$KEY/live1/" 2>/dev/null
 D1=$(curl -fsS "$BASE/status/live1" | grep -o '"discontinuitySequence":[0-9]*' | cut -d: -f2)
+# What a viewer was last shown, to prove the restart does not rewind it.
+PRESEQ=$(media_playlist live1 | grep -o '#EXT-X-MEDIA-SEQUENCE:[0-9]*' | cut -d: -f2)
 # The gap must exceed the server's 10s staleness threshold, or the restart is
 # treated as a continuous timeline and no discontinuity is recorded.
 sleep 12
@@ -449,9 +451,25 @@ if wait_segs live1 2; then
     note "counter unchanged (${D1} → ${D2}); gap may not have exceeded the threshold"
     skip=$((skip+1))
   fi
-  grep -q 'EXT-X-DISCONTINUITY' "$TMP/r.m3u8" 2>/dev/null \
-    && bad "playlist carries a discontinuity tag with no matching timeline break" \
-    || ok "playlist carries no stale discontinuity tags"
+  # The two backends need opposite things here. The Worker cleared its ring
+  # on restart, so the window held one continuous timeline and a tag would
+  # have had no matching break — publishing one put hls.js at a negative
+  # timeline offset. The VPS serves ffmpeg's own playlist straight through,
+  # so the restart really is a timeline break and the tag is what lets a
+  # player reset its decoder instead of stalling on the PTS jump.
+  if [ "$BACKEND" = worker ]; then
+    grep -q 'EXT-X-DISCONTINUITY' "$TMP/r.m3u8" 2>/dev/null \
+      && bad "playlist carries a discontinuity tag with no matching timeline break" \
+      || ok "playlist carries no stale discontinuity tags"
+  else
+    # Sequence must not regress, whatever ffmpeg's counter did.
+    RSEQ=$(grep -o '#EXT-X-MEDIA-SEQUENCE:[0-9]*' "$TMP/r.m3u8" | cut -d: -f2)
+    if [ -n "$RSEQ" ] && [ "${RSEQ:-0}" -ge "${PRESEQ:-0}" ]; then
+      ok "media sequence did not regress across restart (${PRESEQ} → ${RSEQ})"
+    else
+      bad "media sequence regressed (${PRESEQ} → ${RSEQ}) — players stall"
+    fi
+  fi
   grep -q '^#EXTM3U' "$TMP/r.m3u8" && ok "playlist valid after restart" \
                                    || bad "playlist broken after restart"
   MISS=0
