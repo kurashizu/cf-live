@@ -64,6 +64,16 @@ media_playlist() {
 
 echo "target: $BASE"
 
+# The Worker and VPS backends have deliberately different contracts, so the
+# assertions below have to know which one they are talking to. The VPS relay
+# reports a deliberately smaller /status and never caches a playlist; the
+# Worker caches the offline playlist because it had a request quota to
+# survive. Detected from a field only the Worker publishes.
+BACKEND=vps
+curl -fsS "$BASE/status/backendprobe" 2>/dev/null | grep -q 'uptimeSeconds' \
+  && BACKEND=worker
+echo "backend: $BACKEND"
+
 # ─────────────────────────────────────────────────────────────────────
 sec "1. Offline stream (never broadcast)"
 PL="$TMP/off.m3u8"
@@ -317,11 +327,16 @@ if wait_segs live1 3; then
   fi
 fi
 
-sec "9b. Offline playlist is edge-cached (idle viewers must be cheap)"
-# The offline playlist is byte-identical on every request, so it can be cached
-# where a live playlist cannot. Without this an idle viewer polls the Worker
-# forever; measured at ~0.67 req/s, enough for three open tabs to exhaust the
-# free tier while showing nothing.
+sec "9b. Offline playlist caching follows the backend's contract"
+# These two backends want opposite things here, so the assertion flips.
+#
+# Worker: the offline playlist is byte-identical every time and the free tier
+# has a request quota, so caching it is what stops an idle tab from draining
+# that quota (measured ~0.67 req/s, three tabs enough to exhaust it).
+#
+# VPS: no quota to protect, and caching a playlist is actively dangerous — a
+# player handed byte-identical bytes concludes there is nothing new and stops
+# fetching fragments. It sends no-store and must never report a hit.
 HITS=0; TOTAL=0
 for _ in $(seq 1 5); do
   S=$(hdr "$BASE/live/idlecachecheck/index.m3u8" | grep -i 'cf-cache-status' | tr -d '\r' | awk '{print $2}')
@@ -329,13 +344,17 @@ for _ in $(seq 1 5); do
   echo "$S" | grep -qi HIT && HITS=$((HITS+1))
   sleep 1
 done
-if [ "$TOTAL" -gt 0 ] && [ "$HITS" -ge 2 ]; then
-  ok "offline playlist hits the edge cache ($HITS/$TOTAL)"
-elif hdr "$BASE/live/idlecachecheck/index.m3u8" | grep -qi 'cf-cache-status'; then
-  bad "offline playlist never cached ($HITS/$TOTAL hits) — idle viewers drain quota"
-else
+if ! hdr "$BASE/live/idlecachecheck/index.m3u8" | grep -qi 'cf-cache-status'; then
   note "no edge cache in this environment (local dev)"
   skip=$((skip+1))
+elif [ "$BACKEND" = worker ]; then
+  [ "$HITS" -ge 2 ] \
+    && ok "offline playlist hits the edge cache ($HITS/$TOTAL)" \
+    || bad "offline playlist never cached ($HITS/$TOTAL hits) — idle viewers drain quota"
+else
+  [ "$HITS" = 0 ] \
+    && ok "offline playlist is never cached ($HITS/$TOTAL hits), as intended" \
+    || bad "offline playlist was cached ($HITS/$TOTAL hits) — this freezes players"
 fi
 
 sec "9c. Starting a broadcast purges the cached OFFLINE playlist"
@@ -385,20 +404,25 @@ sec "10. Unknown and malformed playback requests"
 
 sec "11. Status endpoint contract"
 S=$(curl -fsS "$BASE/status/live1")
-for f in live segmentsBuffered mediaSequence discontinuitySequence totalSegments \
-         targetDuration playlistSize maxSegments bufferedBytes \
-         secondsSinceLastIngest uptimeSeconds; do
+# Fields common to both backends, then the Worker's extras. The VPS relay
+# reports what it can observe from the filesystem and omits the rest rather
+# than inventing values.
+FIELDS="live segmentsBuffered bufferedBytes secondsSinceLastIngest"
+[ "$BACKEND" = worker ] && FIELDS="$FIELDS mediaSequence discontinuitySequence \
+  totalSegments targetDuration playlistSize maxSegments uptimeSeconds"
+for f in $FIELDS; do
   echo "$S" | grep -q "\"$f\"" && ok "status has $f" || bad "status missing $f"
 done
-# Must always be numeric so consumers need no null handling.
-echo "$S" | grep -q '"secondsSinceLastIngest":null' \
+# Must always be numeric so consumers need no null handling. Python's
+# json.dumps puts a space after the colon, so the patterns allow one.
+echo "$S" | grep -qE '"secondsSinceLastIngest": ?null' \
   && bad "secondsSinceLastIngest is null" \
   || ok "secondsSinceLastIngest is numeric"
 S2=$(curl -fsS "$BASE/status/neverbroadcast")
-echo "$S2" | grep -q '"live":false' \
+echo "$S2" | grep -qE '"live": ?false' \
   && ok "never-broadcast stream reports live:false" \
   || bad "never-broadcast stream reports live:true"
-echo "$S2" | grep -q '"secondsSinceLastIngest":-1' \
+echo "$S2" | grep -qE '"secondsSinceLastIngest": ?-1' \
   && ok "never-ingested reports -1 sentinel" \
   || bad "never-ingested sentinel wrong"
 
