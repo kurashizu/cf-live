@@ -625,12 +625,14 @@ export class LiveRoom {
     // so entries never disappear from the top of the list. Some players lose
     // the timeline when the playlist they are following is truncated from the
     // front, and this isolates that behaviour.
-    const mode = this.env.PLAYLIST_AS_VOD || '';
-    // Both modes advertise the entire buffer rather than a trailing window:
-    // 'grow' to test truncation, 'pseudovod' because a player that stops at
-    // ENDLIST should be handed as much media as possible before it does.
-    const growOnly = mode === 'grow' || mode === 'pseudovod';
-    const window = growOnly
+    // Pseudo-VOD terminates every playlist with ENDLIST. AVPro in VRChat
+    // renders a normal live playlist as black video but plays the same
+    // segments when the playlist claims to be finished, so this trades live
+    // semantics for actually being visible. It advertises the whole buffer
+    // rather than a trailing window, since such a player stops at the end of
+    // whatever it was given.
+    const pseudoVod = this.env.PSEUDO_VOD === '1';
+    const window = pseudoVod
       ? this.order.slice()
       : trailingWindow(
           this.order,
@@ -657,22 +659,6 @@ export class LiveRoom {
     // point toward the live edge, but a stream carrying it would not play in
     // AVPro at all, and the window is only a few seconds long anyway — the
     // short window achieves the same latency without the tag.
-    // PLAYLIST_AS_VOD isolates which part of a live playlist a player rejects:
-    //   '1'       -> PLAYLIST-TYPE:VOD plus ENDLIST (plays, but stops at the
-    //                end of the window)
-    //   'endlist' -> ENDLIST only, no PLAYLIST-TYPE
-    //   'type'    -> PLAYLIST-TYPE:EVENT, no ENDLIST
-    //   unset     -> a normal live playlist
-    const vodMode = this.env.PLAYLIST_AS_VOD || '';
-    const asVod = vodMode === '1';
-    // AVPro in VRChat will not follow a live playlist at all — verified by
-    // testing: the same segments play when the playlist carries ENDLIST and
-    // render black without it. 'pseudovod' therefore terminates every
-    // response with ENDLIST while still advancing the window, so such a
-    // player treats each poll as a short finished clip and keeps requesting
-    // the next one. Players that do handle live playlists are unaffected,
-    // since the content still moves forward.
-    const pseudoVod = vodMode === 'pseudovod';
     const lines = [
       '#EXTM3U',
       // EXT-X-MAP requires version 7; plain TS segments only need 3.
@@ -680,10 +666,7 @@ export class LiveRoom {
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
     ];
-    if (asVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
-    // EVENT means "segments are only ever appended" — a live playlist that
-    // some players follow more willingly than an untyped one.
-    else if (vodMode === 'type') lines.push('#EXT-X-PLAYLIST-TYPE:EVENT');
+    if (pseudoVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
     if (this.discontinuitySequence > 0) {
       lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${this.discontinuitySequence}`);
     }
@@ -707,7 +690,7 @@ export class LiveRoom {
       // them.
       lines.push(file);
     }
-    if (asVod || pseudoVod || vodMode === 'endlist') lines.push('#EXT-X-ENDLIST');
+    if (pseudoVod) lines.push('#EXT-X-ENDLIST');
     lines.push('');
 
     return new Response(lines.join('\n'), {

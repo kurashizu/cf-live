@@ -44,8 +44,12 @@ OFFLINE_CACHE_TTL = "3"
 # and video/mp2t appears to route some players into a demuxer path that fails.
 SEGMENT_CONTENT_TYPE = "octet"
 
-# Debug: present the live window as a finished VOD playlist.
-PLAYLIST_AS_VOD = ""
+# Terminate every playlist with ENDLIST, advertising the whole buffer.
+# AVPro in VRChat renders a normal live playlist as black video but plays the
+# same segments when the playlist claims to be finished. Playback then stops
+# at the end of the buffer, and latency equals the buffer length, so this is
+# a fallback rather than the default.
+PSEUDO_VOD = "0"
 
 # Edge cache lifetime for immutable segments, in seconds.
 SEGMENT_CACHE_TTL = "30"
