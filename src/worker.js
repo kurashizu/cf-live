@@ -1,5 +1,5 @@
 /**
- * cf-live — low-latency HLS relay on Cloudflare Workers + Durable Objects.
+ * KRSZ Live — low-latency HLS relay on Cloudflare Workers + Durable Objects.
  *
  * Ingest:   OBS (custom FFmpeg output, hls muxer, method=PUT)
  *             PUT /ingest/:key/:stream/live.m3u8

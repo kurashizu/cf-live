@@ -1,4 +1,4 @@
-# cf-live
+# KRSZ Live
 
 Low-latency HLS live relay on Cloudflare Workers + Durable Objects.
 Ingest from OBS over HTTP, play anywhere an HLS player runs — including the

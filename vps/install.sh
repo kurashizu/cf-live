@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up cf-live on a VPS. Idempotent — safe to re-run.
+# Set up KRSZ Live on a VPS. Idempotent — safe to re-run.
 #
 # Expects nginx (with the dav module) and cloudflared already installed.
 # Run as root, or with sudo.

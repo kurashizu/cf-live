@@ -1,4 +1,4 @@
-# cf-live on a VPS
+# KRSZ Live on a VPS
 
 > Deployed and verified on Oracle Linux 9.7 (1 core, 1 GB) behind a Cloudflare
 > tunnel. Ingest and playback both work end to end. One thing still needs doing

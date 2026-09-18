@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cf-live: an HLS relay in the standard library.
+"""KRSZ Live: an HLS relay in the standard library.
 
 Receives HLS segments from OBS over HTTP PUT and serves them to players.
 Written against Python 3.9 with no third-party packages, because the target
@@ -15,6 +15,7 @@ then deleted. Disk would only add wear.
 """
 
 import argparse
+import hashlib
 import hmac
 import os
 import re
@@ -29,6 +30,9 @@ from pathlib import Path
 RESERVED = {
     "healthz", "health", "live", "ingest", "index.html",
     "favicon.ico", "robots.txt", "sitemap.xml",
+    # Endpoint prefixes: /status is the status API, and "offline" would
+    # collide with the shared slate.
+    "status", "offline",
 }
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -105,12 +109,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(page, "text/html; charset=utf-8", "no-store")
             return
 
-        # The offline slate. Shared by every idle stream, immutable, and
-        # deliberately served from one path so it caches once.
+        # The offline slate. Shared by every idle stream and cached hard —
+        # but only at the fingerprinted path. Regenerating the slate changes
+        # the fingerprint, so a new slate is never masked by an old cached
+        # copy (that bug cost hours once already).
+        m = re.match(r"^/live/_offline\.([0-9a-f]{8})\.ts$", path)
+        if m:
+            fresh = m.group(1) == CONFIG.get("slate_version")
+            self.send_file(
+                Path(CONFIG["root"]) / "offline" / "offline.ts",
+                TS_TYPE,
+                "public, max-age=31536000, immutable" if fresh
+                else "public, max-age=60",
+            )
+            return
+        # The unversioned path stays for anything holding an old playlist,
+        # with a short TTL so it self-heals.
         if path == "/live/offline.ts":
             self.send_file(
                 Path(CONFIG["root"]) / "offline" / "offline.ts",
-                TS_TYPE, "public, max-age=31536000, immutable",
+                TS_TYPE, "public, max-age=60",
             )
             return
 
@@ -256,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
         for _ in range(CONFIG["slate_window"]):
             # Three decimals and the ", no desc" title are SRS's exact output.
             lines.append(f"#EXTINF:{dur:.3f}, no desc")
-            lines.append("/live/offline.ts")
+            lines.append(f"/live/_offline.{CONFIG['slate_version']}.ts")
         return "\n".join(lines) + "\n"
 
     def serve_segment(self, stream: str, name: str):
@@ -494,6 +512,18 @@ def main():
     CONFIG.update(vars(args))
     Path(args.root).mkdir(parents=True, exist_ok=True)
 
+    # Fingerprint the slate so its cached URL changes whenever the file does.
+    slate = Path(args.root) / "offline" / "offline.ts"
+    try:
+        CONFIG["slate_version"] = hashlib.sha256(
+            slate.read_bytes()).hexdigest()[:8]
+    except OSError:
+        # No slate on disk: idle streams will 404 the segment rather than
+        # serve a stale one. Surfaced loudly because it breaks the offline
+        # screen entirely.
+        CONFIG["slate_version"] = "00000000"
+        print(f"  WARNING: no slate at {slate}", flush=True)
+
     if args.reap_after > 0:
         threading.Thread(
             target=reap_stale, args=(Path(args.root), args.reap_after),
@@ -504,7 +534,7 @@ def main():
     # segments are served concurrently.
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     srv.daemon_threads = True
-    print(f"cf-live listening on {args.bind}:{args.port}", flush=True)
+    print(f"KRSZ Live listening on {args.bind}:{args.port}", flush=True)
     print(f"  segments: {args.root}", flush=True)
     try:
         srv.serve_forever()

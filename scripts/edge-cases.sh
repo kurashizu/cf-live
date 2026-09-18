@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boundary and failure-mode tests for cf-live.
+# Boundary and failure-mode tests for KRSZ Live.
 #
 # Covers the situations a real broadcast actually hits: offline viewers,
 # encoder restarts, malformed ingest, oversized segments, concurrent streams,

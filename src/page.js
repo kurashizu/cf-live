@@ -42,7 +42,7 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cf-live — low-latency HLS relay on Cloudflare</title>
+<title>KRSZ Live — low-latency HLS relay</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -181,8 +181,8 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
 <div class="wrap">
 
 <header>
-  <h1>cf-live<span class="dot">.</span></h1>
-  <p class="tagline">Low-latency HLS relay on Cloudflare Workers + Durable Objects.
+  <h1>KRSZ Live<span class="dot">.</span></h1>
+  <p class="tagline">Low-latency HLS relay behind the Cloudflare edge.
   Ingest from OBS, play anywhere — including VRChat.</p>
 </header>
 
@@ -371,7 +371,7 @@ limited to <code>[A-Za-z0-9._-]</code>, max 128 characters.</p>
   <tr><td><span class="method get">GET</span></td>
       <td><code>/live/:stream/:file.ts</code></td>
       <td>Segment bytes. Immutable, so edge-cached — only the first viewer per
-          region reaches the Durable Object.</td></tr>
+          region reaches the origin.</td></tr>
   <tr><td><span class="method get">GET</span></td>
       <td><code>/status/:stream</code></td>
       <td>JSON: live flag, buffered segments, sequence, bytes, uptime.</td></tr>
@@ -396,9 +396,9 @@ limited to <code>[A-Za-z0-9._-]</code>, max 128 characters.</p>
 }</code></pre></div>
 
 <h3>Multiple streams</h3>
-<p class="small">Any stream name is created on demand and gets its own Durable Object.
-Push to <code>/ingest/&lt;KEY&gt;/room2/…</code> and play <code>/room2</code> — no
-configuration required.</p>
+<p class="small">Any stream name is created on demand and gets its own independent
+window. Push to <code>/ingest/&lt;KEY&gt;/room2/…</code> and play <code>/room2</code>
+— no configuration required.</p>
 
 <!-- ============ ARCHITECTURE ============ -->
 <h2>How it works</h2>
@@ -409,18 +409,17 @@ configuration required.</p>
   <div class="kv"><div class="k">Expected latency</div><div class="v">~${estLatency}s</div></div>
 </div>
 
-<div class="snip"><pre><code>OBS ──PUT segments──> Worker ──> Durable Object
-                        │          (in-memory ring, ${maxSegs} segments)
-                        │               │
-    viewers <──edge cache┴───────────────┘
-    (.m3u8: no-store · .ts: immutable)</code></pre></div>
+<div class="snip"><pre><code>OBS ──PUT segments──> Cloudflare edge ──> relay
+                              │          (RAM, newest ${maxSegs} segments)
+                              │              │
+          viewers <──edge cache┴──────────────┘
+          (.m3u8: no-store · .ts: immutable)</code></pre></div>
 
 <p class="small">
-  Media never touches R2 or Durable Object storage. A live segment is written once,
-  read for a few seconds, then irrelevant — persisting it buys nothing, and keeping
-  it in the heap also sidesteps the 128 KB per-value limit on DO storage. Segments
-  are served through the Cloudflare edge cache, so a single Durable Object handles
-  one origin pull per segment per region rather than one per viewer.
+  Media never touches durable storage. A live segment is written once, read for a
+  few seconds, then irrelevant — persisting it buys nothing. Segments are held in
+  RAM and served through the Cloudflare edge cache, so the origin answers one pull
+  per segment per region rather than one per viewer.
 </p>
 
 <div class="note">
@@ -447,7 +446,7 @@ configuration required.</p>
   leave it off.
 </div>
 
-<footer>cf-live · runs within the Cloudflare Workers free tier ·
+<footer>KRSZ Live ·
   <a href="/healthz">health</a></footer>
 </div>
 

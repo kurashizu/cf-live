@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the animated OFFLINE slate frames for cf-live.
+"""Generate the animated OFFLINE slate frames for KRSZ Live.
 
 Pure-Python PNG writer with a 5x7 bitmap font, so the build needs no fonts,
 no Pillow, and no ffmpeg drawtext (which this platform's build lacks).
