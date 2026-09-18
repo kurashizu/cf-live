@@ -42,14 +42,31 @@ TS_TYPE = "video/MP2T"
 
 CONFIG = {}
 
-# Per-stream playlist sequence state, keyed by stream name:
-#   {"offset": int, "last": int, "restart": bool}
-# ffmpeg restarts its segment counter at 0 whenever the encoder relaunches,
-# and the playlist it uploads carries that counter straight through. A live
-# EXT-X-MEDIA-SEQUENCE that goes backwards violates RFC 8216 and stalls
-# players, so the served sequence is made monotonic here.
+# Per-stream timeline state, keyed by stream name.
+#
+# A viewer must see ONE continuous stream whether or not anybody is
+# broadcasting. Serving ffmpeg's playlist while live and a separate slate
+# playlist while idle gives two unrelated timelines, and crossing between
+# them forces the player to tear down and rebuild — the visible stall this
+# state exists to remove.
+#
+# So the playlist is built here instead of passed through: a monotonic
+# sequence, a rolling window of entries, and a discontinuity marker emitted
+# only at a real seam (slate -> live, live -> slate, encoder restart).
+#
+#   {"seq": int,            # media sequence of window[0]
+#    "window": [(uri, dur, disc)],
+#    "live": bool,          # was the last appended entry live content
+#    "last_raw": str,       # newest ffmpeg segment already appended
+#    "next_slate": float}   # when the next slate entry is due
 SEQ_STATE = {}
 SEQ_LOCK = threading.Lock()
+
+# How many distinct slate URIs to rotate through. Must comfortably exceed the
+# playlist window so no two entries in one window ever share a URI — a player
+# keys fragments by URI and would treat a repeat as one fragment, which is the
+# bug that made the slate play once and stall.
+SLATE_POSITIONS = 64
 
 
 def safe(name: str) -> bool:
@@ -122,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         # but only at the fingerprinted path. Regenerating the slate changes
         # the fingerprint, so a new slate is never masked by an old cached
         # copy (that bug cost hours once already).
-        m = re.match(r"^/live/_offline\.([0-9a-f]{8})\.ts$", path)
+        m = re.match(r"^/live/_offline\.([0-9a-f]{8})(?:\.\d+)?\.ts$", path)
         if m:
             fresh = m.group(1) == CONFIG.get("slate_version")
             self.send_file(
@@ -192,25 +209,131 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(body.encode(), M3U8, "no-store")
 
     def serve_media_playlist(self, stream: str):
-        live = stream_dir(stream) / "live.m3u8"
-        if live.is_file() and not self.stream_stale(stream):
-            # Never cache a live playlist: a player reusing a stale copy sees
-            # the stream frozen. Plain no-store, not no-cache +
-            # must-revalidate — Cloudflare strips that combination, leaving no
-            # directive at all, at which point a client caches anyway.
-            try:
-                body = live.read_bytes()
-            except OSError:
-                self.send_text("not found\n", 404)
-                return
-            self.send_body(self.trim_window(body, stream), M3U8, "no-store")
-            return
-        # Nothing being broadcast. Serve a rolling slate playlist rather than
-        # an empty one or a 404: an empty playlist shows the viewer nothing,
-        # a 404 makes AVPro give up permanently, and a single static entry
-        # looks finished so the player stops polling and never notices the
-        # broadcast starting.
-        self.send_body(self.offline_playlist().encode(), M3U8, "no-store")
+        # Never cache a live playlist: a player reusing a stale copy sees the
+        # stream frozen. Plain no-store, not no-cache + must-revalidate —
+        # Cloudflare strips that combination, leaving no directive at all, at
+        # which point a client caches anyway.
+        self.send_body(self.continuous_playlist(stream), M3U8, "no-store")
+
+    def continuous_playlist(self, stream: str) -> bytes:
+        """Build one unbroken timeline for a stream, live or not.
+
+        The viewer's player is never told the broadcast stopped. When ingest
+        is flowing, live segments are appended; when it is not, slate
+        segments are, and the seam carries #EXT-X-DISCONTINUITY so the
+        decoder resets without the stream itself ending. The media sequence
+        only ever climbs, so no poll ever looks like a playlist reset — which
+        is what previously forced the client to destroy and rebuild the
+        player, the stall this removes.
+        """
+        import time
+        now = time.time()
+        dur = CONFIG["slate_duration"]
+        keep = max(CONFIG["window"], 1)
+
+        with SEQ_LOCK:
+            st = SEQ_STATE.get(stream)
+            if st is None:
+                st = {"seq": 0, "window": [], "live": False,
+                      "last_raw": "", "next_slate": 0.0}
+                SEQ_STATE[stream] = st
+
+            fresh = self.live_segments(stream)
+            if fresh:
+                # Append only what has not been published yet, preserving
+                # ffmpeg's order.
+                new_entries = []
+                if st["last_raw"]:
+                    try:
+                        after = [n for n, _ in fresh]
+                        idx = after.index(st["last_raw"])
+                        pending = fresh[idx + 1:]
+                    except ValueError:
+                        # The name is gone from disk: the encoder restarted
+                        # and renumbered. Everything on offer is new.
+                        pending = fresh
+                else:
+                    pending = fresh
+                for name, d in pending:
+                    new_entries.append((f"{name}", d, not st["live"]))
+                    st["live"] = True
+                if new_entries:
+                    st["last_raw"] = pending[-1][0]
+                    st["window"].extend(new_entries)
+                    # Slate resumes only after ingest has actually stopped.
+                    st["next_slate"] = now + dur
+            else:
+                # Idle. Add a slate entry when the previous one has played
+                # out, so the timeline advances at real time rather than as
+                # fast as the viewer polls.
+                if now >= st["next_slate"]:
+                    # A distinct URI per position: a player keys fragments by
+                    # URI, so repeating one URI reads as a single fragment —
+                    # the slate would play once (~2s) and stall with the
+                    # sequence still climbing. The bytes are the same object;
+                    # only the path differs.
+                    # The counter only has to make consecutive entries in
+                    # the window distinct, so it wraps over a small set.
+                    # Letting it climb forever would mint ~1800 immutable
+                    # cache entries per idle hour for what is one 35 KB
+                    # object.
+                    pos = st["seq"] + len(st["window"])
+                    uri = (f"/live/_offline.{CONFIG['slate_version']}"
+                           f".{pos % SLATE_POSITIONS}.ts")
+                    st["window"].append((uri, dur, st["live"] or not st["window"]))
+                    st["live"] = False
+                    st["last_raw"] = ""
+                    st["next_slate"] = max(now, st["next_slate"]) + dur
+
+            # Roll the window, advancing the sequence by whatever was dropped.
+            if len(st["window"]) > keep:
+                dropped = len(st["window"]) - keep
+                st["window"] = st["window"][dropped:]
+                st["seq"] += dropped
+            # A discontinuity that scrolled to the front of the window is
+            # still meaningful, but one on the very first entry of a brand
+            # new timeline is not — there is nothing before it to break from.
+            entries = list(st["window"])
+            seq = st["seq"]
+
+        target = max(int(round(max((d for _, d, _ in entries), default=dur))), 1)
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+                 f"#EXT-X-MEDIA-SEQUENCE:{seq}",
+                 f"#EXT-X-TARGETDURATION:{target}"]
+        for i, (uri, d, disc) in enumerate(entries):
+            if disc and not (seq == 0 and i == 0):
+                lines.append("#EXT-X-DISCONTINUITY")
+            # Three decimals and the ", no desc" title are SRS's exact output.
+            lines.append(f"#EXTINF:{d:.3f}, no desc")
+            lines.append(uri)
+        return ("\n".join(lines) + "\n").encode()
+
+    def live_segments(self, stream: str):
+        """The segments ffmpeg is currently advertising, oldest first.
+
+        Read from ffmpeg's own playlist rather than the directory listing:
+        the playlist is what the encoder considers complete, and a segment
+        still being written is not in it yet.
+        """
+        if self.stream_stale(stream):
+            return []
+        try:
+            body = (stream_dir(stream) / "live.m3u8").read_text("utf-8", "replace")
+        except OSError:
+            return []
+        out, pending = [], None
+        for line in body.splitlines():
+            if line.startswith("#EXTINF:"):
+                try:
+                    pending = float(line.split(":", 1)[1].split(",")[0])
+                except ValueError:
+                    pending = CONFIG["slate_duration"]
+            elif line and not line.startswith("#"):
+                name = line.strip()
+                if safe(name) and (stream_dir(stream) / name).is_file():
+                    out.append((name, pending or 1.0))
+                pending = None
+        return out
 
     def stream_stale(self, stream: str) -> bool:
         """True once a broadcast has clearly stopped.
@@ -615,6 +738,10 @@ def main():
     # viewers get a 404 for it.
     if args.keep_segments > 0 and args.keep_segments <= args.window:
         args.keep_segments = args.window + 1
+    # Two entries in one window must never share a slate URI, or a player
+    # collapses them into a single fragment and the slate stalls.
+    if args.window >= SLATE_POSITIONS:
+        sys.exit(f"--window must be below {SLATE_POSITIONS}")
     CONFIG.update(vars(args))
     Path(args.root).mkdir(parents=True, exist_ok=True)
 

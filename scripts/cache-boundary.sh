@@ -36,6 +36,7 @@ cfstatus() {
   curl -sS -D- -o /dev/null "$1" 2>/dev/null \
     | tr -d '\r' | grep -i '^cf-cache-status:' | awk '{print tolower($2)}'
 }
+code() { curl -sS -o /dev/null -w '%{http_code}' "$1" 2>/dev/null; }
 hdrval() {
   curl -sS -D- -o /dev/null "$2" 2>/dev/null \
     | tr -d '\r' | grep -i "^$1:" | head -1 | cut -d' ' -f2-
@@ -234,49 +235,79 @@ fi
 kill "$pid2" 2>/dev/null; wait "$pid2" 2>/dev/null
 
 # ─────────────────────────────────────────────────────────────────────
-sec "7. Offline viewer sees a stream that starts mid-watch"
-# The scenario you named: someone is staring at the OFFLINE slate when the
-# broadcast begins. If the offline response is cached anywhere, they stay on
-# the slate forever.
+sec "7. A broadcast starting mid-watch must not break the timeline"
+# Someone is watching the slate when the broadcast begins. The server
+# publishes one continuous timeline, so what matters is not just that live
+# content appears, but that the sequence never rewinds and every fragment
+# stays fetchable across the seam — a rewind is what forces a player to tear
+# down and rebuild, which is the visible stall.
 FRESH="cbstart$$"
-note "polling $FRESH while offline, then starting a broadcast"
-off1=$(curl -fsS "$BASE/live/$FRESH/index.m3u8" | grep -c 'offline' || true)
+note "polling $FRESH while idle, then starting a broadcast"
+sseq() { curl -fsS "$BASE/live/$1/index.m3u8" 2>/dev/null \
+         | grep -o 'MEDIA-SEQUENCE:[0-9]*' | cut -d: -f2; }
 pid3=$(publish "$FRESH" 45)
-switched=""
+switched=""; prev=-1; regress=0; miss=0; polls=0
 for i in $(seq 1 40); do
   body=$(curl -fsS "$BASE/live/$FRESH/index.m3u8" 2>/dev/null)
-  if ! echo "$body" | grep -q 'offline'; then
-    switched="$i"; break
+  q=$(echo "$body" | grep -o 'MEDIA-SEQUENCE:[0-9]*' | cut -d: -f2)
+  if [ -n "$q" ]; then
+    polls=$((polls+1))
+    [ "$prev" -ge 0 ] && [ "$q" -lt "$prev" ] && {
+      regress=$((regress+1)); note "  sequence rewound $prev -> $q"; }
+    prev="$q"
   fi
+  # Every advertised fragment must resolve, slate or live.
+  while read -r u; do
+    [ -z "$u" ] && continue
+    case "$u" in /*) url="$BASE$u";; *) url="$BASE/live/$FRESH/$u";; esac
+    [ "$(code "$url")" = 200 ] || { miss=$((miss+1)); note "  unfetchable: $u"; }
+  done < <(echo "$body" | grep -v '^#' | tr -d '\r')
+  if [ -z "$switched" ] && echo "$body" | grep -qE '^seg|^[^#/].*\.ts'; then
+    switched="$i"
+  fi
+  [ -n "$switched" ] && [ "$i" -gt $((switched + 4)) ] && break
   sleep 1
 done
 if [ -n "$switched" ]; then
-  ok "offline viewer saw live content after ${switched}s of polling"
-  if [ "$switched" -le 8 ]; then
-    ok "switchover was prompt (${switched}s)"
-  else
-    wrn "switchover took ${switched}s — slower than a segment cycle"
-  fi
+  ok "live content entered the timeline after ${switched}s"
+  [ "$switched" -le 8 ] && ok "switchover was prompt (${switched}s)" \
+    || wrn "switchover took ${switched}s — slower than a segment cycle"
 else
-  bad "offline viewer never saw live content — offline response is stale/cached"
+  bad "live content never entered the timeline"
 fi
+[ "$regress" = 0 ] && ok "sequence never rewound across the seam ($polls polls)" \
+  || bad "sequence rewound $regress times — players will stall and rebuild"
+[ "$miss" = 0 ] && ok "every advertised fragment stayed fetchable" \
+  || bad "$miss advertised fragments were unfetchable"
 kill "$pid3" 2>/dev/null; wait "$pid3" 2>/dev/null
 
 # ─────────────────────────────────────────────────────────────────────
-sec "8. Stream ends — viewer returns to offline, not a dead playlist"
-note "waiting for reap/offline fallback (up to 40s)"
-back=""
+sec "8. Stream ends — the timeline continues on the slate"
+# The other seam. A stopped broadcast must not freeze the playlist or end it;
+# the slate takes over in the same timeline so the player keeps polling and
+# picks the broadcast back up whenever it resumes.
+note "waiting for the slate to take over (up to 40s)"
+back=""; prev2=-1; regress2=0
 for i in $(seq 1 40); do
   body=$(curl -fsS "$BASE/live/$FRESH/index.m3u8" 2>/dev/null)
-  if echo "$body" | grep -q 'offline'; then back="$i"; break; fi
+  q=$(echo "$body" | grep -o 'MEDIA-SEQUENCE:[0-9]*' | cut -d: -f2)
+  [ -n "$q" ] && [ "$prev2" -ge 0 ] && [ "$q" -lt "$prev2" ] && {
+    regress2=$((regress2+1)); note "  sequence rewound $prev2 -> $q"; }
+  [ -n "$q" ] && prev2="$q"
+  if echo "$body" | grep -q '_offline'; then back="$i"; break; fi
   sleep 1
 done
 if [ -n "$back" ]; then
-  ok "fell back to the offline slate after ${back}s"
+  ok "slate took over the timeline after ${back}s"
 else
-  wrn "did not fall back to offline within 40s"
-  note "stale-stream reaping is set to ${REAP:-300}s, so this may be expected"
+  wrn "slate did not take over within 40s"
 fi
+[ "$regress2" = 0 ] && ok "sequence never rewound leaving the broadcast" \
+  || bad "sequence rewound $regress2 times leaving the broadcast"
+# The playlist must never announce an end: that stops a player polling.
+curl -fsS "$BASE/live/$FRESH/index.m3u8" 2>/dev/null | grep -q 'EXT-X-ENDLIST' \
+  && bad "playlist carries EXT-X-ENDLIST — players stop polling and never resume" \
+  || ok "playlist never announces an end"
 
 # ─────────────────────────────────────────────────────────────────────
 sec "9. Slate asset is versioned so a new slate is never pinned"
