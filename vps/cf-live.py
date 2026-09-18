@@ -343,7 +343,41 @@ class Handler(BaseHTTPRequestHandler):
         tmp = target.with_suffix(target.suffix + ".part")
         tmp.write_bytes(data)
         os.replace(tmp, target)
+        # ffmpeg's delete_segments only prunes when it writes local files; over
+        # HTTP it never sends DELETE, so nothing here would ever be removed and
+        # a long broadcast would fill the tmpfs. Measured: 70 segments and
+        # 12MB after five minutes, still climbing.
+        if not name.endswith(".m3u8"):
+            self.evict(target.parent, name)
         self.send_text("ok\n")
+
+    def evict(self, directory: Path, just_written: str):
+        """Keep only the most recent segments in a stream's directory.
+
+        Ordered by the counter in the filename rather than mtime: ffmpeg
+        numbers segments monotonically, and that is what the playlist
+        references, whereas mtimes can tie at this granularity.
+        """
+        keep = CONFIG["keep_segments"]
+        if keep <= 0:
+            return
+        suffix = Path(just_written).suffix
+        try:
+            files = [p for p in directory.iterdir() if p.suffix == suffix]
+        except OSError:
+            return
+        if len(files) <= keep:
+            return
+
+        def index(p: Path) -> int:
+            m = re.search(r"(\d+)(?=\.[^.]+$)", p.name)
+            return int(m.group(1)) if m else -1
+
+        for stale in sorted(files, key=index)[:-keep]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     def read_body(self):
         """Read a request body, whether length-delimited or chunked.
@@ -432,6 +466,11 @@ def main():
                     help="edge cache lifetime for segments; they are immutable, "
                          "so this only bounds how long a cached copy survives "
                          "after falling out of the playlist")
+    ap.add_argument("--keep-segments", type=int, default=12,
+                    help="segments retained per stream. Must exceed --window "
+                         "so a segment the playlist still references is never "
+                         "deleted; the surplus is the tolerance for a viewer "
+                         "lagging behind the live edge")
     ap.add_argument("--window", type=int, default=3,
                     help="segments to advertise; 0 passes ffmpeg's playlist "
                          "through. A player starts at the oldest entry, so "
@@ -448,6 +487,10 @@ def main():
     if not args.key:
         sys.exit("an ingest key is required (--key or INGEST_KEY)")
 
+    # A segment the playlist still advertises must never be evicted, or
+    # viewers get a 404 for it.
+    if args.keep_segments > 0 and args.keep_segments <= args.window:
+        args.keep_segments = args.window + 1
     CONFIG.update(vars(args))
     Path(args.root).mkdir(parents=True, exist_ok=True)
 
