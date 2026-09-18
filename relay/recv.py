@@ -27,7 +27,19 @@ import struct
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    # Python 3.6 (Alibaba Cloud Linux 3 ships 3.6.8) has no
+    # ThreadingHTTPServer. Compose it the same way 3.7+ does: a slow or
+    # stalled viewer must not block the others, and segments are served
+    # concurrently.
+    import socketserver
+
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wire
@@ -43,7 +55,43 @@ STATE = {
     "stats": collections.Counter(),
     "last_packet": 0.0,
     "started": time.time(),
+    # The frontend, mirrored from the origin. Held in memory and refreshed
+    # in the background: fetching it per request would put the origin's
+    # 280 ms RTT and 730 ms TCP jitter in front of every page load.
+    "page": b"",
+    "page_fetched": 0.0,
 }
+
+
+def mirror_page(origin, interval, log_once=[False]):
+    """Keep a local copy of the origin's landing page.
+
+    Rewrites the origin's own absolute URLs to relative ones so the player
+    on the mirrored page talks to this relay rather than reaching back
+    across the border, which is the whole point of running it here.
+    """
+    import urllib.request
+    while True:
+        try:
+            req = urllib.request.Request(origin + "/")
+            # Cloudflare answers urllib's default agent with 403.
+            req.add_header("User-Agent", "krsz-relay/1")
+            with urllib.request.urlopen(req, timeout=20) as f:
+                body = f.read()
+            if body:
+                body = body.replace(b"https://live.krsz.in", b"")
+                with STATE["lock"]:
+                    STATE["page"] = body
+                    STATE["page_fetched"] = time.time()
+                STATE["stats"]["page_mirrored"] += 1
+                if not log_once[0]:
+                    print("mirrored frontend (%d bytes)" % len(body), flush=True)
+                    log_once[0] = True
+        except Exception as e:
+            STATE["stats"]["page_error"] += 1
+            if not log_once[0]:
+                print("frontend mirror failed: %s" % type(e).__name__, flush=True)
+        time.sleep(interval)
 
 
 class Reassembler(object):
@@ -229,6 +277,62 @@ def receiver_loop(args):
             STATE["stats"]["bye"] += 1
 
 
+def available_playlist(body, have):
+    """Trim a playlist to the fragments this relay actually holds.
+
+    The sender advertises a segment once it has sent the shards; recovery
+    here lags that by however long the missing shards take to arrive. Any
+    fragment still in flight is dropped from the tail, and EXT-X-MEDIA-
+    SEQUENCE is advanced by however many were dropped from the *front*, so a
+    player's idea of the live edge stays consistent with what it can fetch.
+
+    Returns None when nothing is available, so the caller can answer 503
+    rather than publish an empty playlist -- an empty one reads as a stream
+    that exists but has no content, and players handle it poorly.
+    """
+    header, entries = [], []
+    pending = None
+    seq = 0
+    for line in body.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                seq = int(line.split(":", 1)[1])
+            except ValueError:
+                pass
+            header.append(line)
+        elif line.startswith("#EXTINF:"):
+            pending = line
+        elif line and not line.startswith("#"):
+            entries.append((pending, line))
+            pending = None
+        elif line:
+            header.append(line)
+
+    kept = [(inf, uri) for inf, uri in entries if uri in have]
+    if not kept:
+        return None
+    # Count only the leading absences: those shift the live edge. A hole in
+    # the middle would break continuity, so stop at the first one we hold.
+    dropped_front = 0
+    for inf, uri in entries:
+        if uri in have:
+            break
+        dropped_front += 1
+
+    out = []
+    for line in header:
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            out.append("#EXT-X-MEDIA-SEQUENCE:%d" % (seq + dropped_front))
+        else:
+            out.append(line)
+    for inf, uri in kept:
+        if inf:
+            out.append(inf)
+        out.append(uri)
+    return ("\n".join(out) + "\n").encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -281,13 +385,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_payload(body, "application/json", "no-store")
             return
 
+        # The mirrored frontend. Served at the root only; every stream name
+        # still resolves to a playlist below.
+        if path in ("/", "/index.html"):
+            with STATE["lock"]:
+                page = STATE["page"]
+            if page:
+                self.send_payload(page, "text/html; charset=utf-8", "no-store")
+            else:
+                self.fail(503, "frontend not mirrored yet\n")
+            return
+
         # Playlist. Never cached: a player given identical bytes concludes
         # there is nothing new and stops fetching fragments.
-        if path.endswith(".m3u8") or path in ("/", "/main"):
+        if path.endswith(".m3u8") or path == "/main":
             with STATE["lock"]:
                 body = STATE["playlist"]
+                have = set(STATE["segments"])
             if not body:
                 self.fail(503, "no stream yet\n")
+                return
+            body = available_playlist(body, have)
+            if body is None:
+                self.fail(503, "no fragments recovered yet\n")
                 return
             self.send_payload(body, M3U8, "no-store")
             return
@@ -316,6 +436,10 @@ def main():
     ap.add_argument("--stream-id", type=int, default=1)
     ap.add_argument("--keep", type=int, default=12,
                     help="segments to retain for viewers")
+    ap.add_argument("--origin", default="https://live.krsz.in",
+                    help="where to mirror the frontend from")
+    ap.add_argument("--page-refresh", type=float, default=300.0,
+                    help="seconds between frontend refreshes")
     ap.add_argument("--hello-interval", type=float, default=2.0,
                     help="pinhole refresh; must stay below the security "
                          "group's UDP idle timeout")
@@ -323,6 +447,9 @@ def main():
 
     t = threading.Thread(target=receiver_loop, args=(args,), daemon=True)
     t.start()
+    threading.Thread(target=mirror_page,
+                     args=(args.origin, args.page_refresh),
+                     daemon=True).start()
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
     srv.daemon_threads = True
