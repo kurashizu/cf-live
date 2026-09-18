@@ -42,6 +42,15 @@ TS_TYPE = "video/MP2T"
 
 CONFIG = {}
 
+# Per-stream playlist sequence state, keyed by stream name:
+#   {"offset": int, "last": int, "restart": bool}
+# ffmpeg restarts its segment counter at 0 whenever the encoder relaunches,
+# and the playlist it uploads carries that counter straight through. A live
+# EXT-X-MEDIA-SEQUENCE that goes backwards violates RFC 8216 and stalls
+# players, so the served sequence is made monotonic here.
+SEQ_STATE = {}
+SEQ_LOCK = threading.Lock()
+
 
 def safe(name: str) -> bool:
     return bool(SAFE_NAME.match(name)) and ".." not in name
@@ -184,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def serve_media_playlist(self, stream: str):
         live = stream_dir(stream) / "live.m3u8"
-        if live.is_file():
+        if live.is_file() and not self.stream_stale(stream):
             # Never cache a live playlist: a player reusing a stale copy sees
             # the stream frozen. Plain no-store, not no-cache +
             # must-revalidate — Cloudflare strips that combination, leaving no
@@ -194,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.send_text("not found\n", 404)
                 return
-            self.send_body(self.trim_window(body), M3U8, "no-store")
+            self.send_body(self.trim_window(body, stream), M3U8, "no-store")
             return
         # Nothing being broadcast. Serve a rolling slate playlist rather than
         # an empty one or a 404: an empty playlist shows the viewer nothing,
@@ -203,7 +212,37 @@ class Handler(BaseHTTPRequestHandler):
         # broadcast starting.
         self.send_body(self.offline_playlist().encode(), M3U8, "no-store")
 
-    def trim_window(self, body: bytes) -> bytes:
+    def stream_stale(self, stream: str) -> bool:
+        """True once a broadcast has clearly stopped.
+
+        The playlist file outlives the broadcast: it sits in tmpfs until the
+        reaper removes the directory, which is deliberately slow (minutes) so
+        a brief encoder hiccup does not destroy a stream. But serving that
+        file in the meantime shows viewers a frozen window of segments that
+        are no longer being produced — and after eviction, 404s. Falling back
+        to the rolling slate instead keeps players polling, so they pick the
+        broadcast up the moment it resumes.
+
+        Uses the same grace period as /status so the two never disagree.
+        """
+        import time
+        grace = CONFIG.get("stale_after", 15)
+        if grace <= 0:
+            return False
+        d = stream_dir(stream)
+        try:
+            newest = max(
+                (p.stat().st_mtime for p in d.iterdir()
+                 if p.suffix in (".ts", ".m4s")),
+                default=0,
+            )
+        except OSError:
+            return True
+        if not newest:
+            return True
+        return (time.time() - newest) > grace
+
+    def trim_window(self, body: bytes, stream: str = "") -> bytes:
         """Shorten the playlist to the newest N segments.
 
         A player starts at the oldest advertised entry, so the window length
@@ -244,19 +283,75 @@ class Handler(BaseHTTPRequestHandler):
             return body
 
         dropped = len(entries) - keep
+        # Must advance in step with what was dropped, or a player computes the
+        # wrong live edge.
+        raw = seq + dropped
+        served, restarted = self.monotonic_sequence(stream, raw)
+
         out = []
         for line in header:
             if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                # Must advance in step with what was dropped, or a player
-                # computes the wrong live edge.
-                out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq + dropped}")
+                out.append(f"#EXT-X-MEDIA-SEQUENCE:{served}")
             else:
                 out.append(line)
-        for inf, uri in entries[-keep:]:
+        window = entries[-keep:]
+        for i, (inf, uri) in enumerate(window):
+            # The encoder restarted, so the first segment of the new timeline
+            # does not continue the previous one: different PTS base, possibly
+            # different parameters. Saying so lets the player reset its
+            # decoder instead of stalling on a timestamp jump.
+            if restarted and i == 0:
+                out.append("#EXT-X-DISCONTINUITY")
             if inf:
                 out.append(inf)
             out.append(uri)
         return ("\n".join(out) + "\n").encode()
+
+    def monotonic_sequence(self, stream: str, raw: int):
+        """Map ffmpeg's sequence onto a never-decreasing one.
+
+        Returns (served_sequence, restarted). ffmpeg numbers segments from
+        zero on every relaunch; a live playlist whose EXT-X-MEDIA-SEQUENCE
+        moves backwards is invalid per RFC 8216, and players respond by
+        stalling rather than reseeking. An offset absorbs each restart, so the
+        sequence a viewer sees only ever climbs.
+
+        Kept modest: sequences in the hundreds of thousands make some players
+        render black video, so the offset wraps well below that.
+        """
+        if not stream:
+            return raw, False
+        with SEQ_LOCK:
+            st = SEQ_STATE.get(stream)
+            if st is None:
+                # First sight of this stream: serve ffmpeg's own numbering.
+                SEQ_STATE[stream] = {"offset": 0, "raw": raw, "served": raw,
+                                     "mark": False}
+                return raw, False
+
+            restarted = False
+            if raw < st["raw"]:
+                # ffmpeg relaunched and its counter went back to zero. Resume
+                # just past the last sequence a viewer was shown — tracked as
+                # the served value, not the raw one, so repeated restarts each
+                # compute their offset from what was actually published.
+                st["offset"] = st["served"] + 1 - raw
+                restarted = True
+
+            served = (raw + st["offset"]) % 100000
+            st["raw"] = raw
+            st["served"] = served
+            # #EXT-X-DISCONTINUITY must appear on the first published playlist
+            # of the new timeline and then stop. Emitting it on every poll
+            # would make the player reset its decoder continuously; emitting
+            # it never leaves it stalled on the timestamp jump. "mark" carries
+            # the one-shot across polls, since a restart is detected on the
+            # poll that first sees the lower sequence.
+            if restarted:
+                st["mark"] = True
+            emit = st["mark"]
+            st["mark"] = False
+            return served, emit
 
     def offline_playlist(self) -> str:
         import time
@@ -299,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
         segs = sorted(d.glob("*.ts")) + sorted(d.glob("*.m4s")) if d.is_dir() else []
         newest = max((p.stat().st_mtime for p in segs), default=0)
         body = json.dumps({
-            "live": bool(segs) and (time.time() - newest) < 15,
+            "live": bool(segs) and (time.time() - newest) < CONFIG.get("stale_after", 15),
             "segmentsBuffered": len(segs),
             "bufferedBytes": sum(p.stat().st_size for p in segs),
             "secondsSinceLastIngest": round(time.time() - newest, 2) if newest else -1,
@@ -460,10 +555,18 @@ def reap_stale(root: Path, idle_seconds: int, interval: int = 60):
                 files = list(d.iterdir())
                 if not files:
                     d.rmdir()
+                    with SEQ_LOCK:
+                        SEQ_STATE.pop(d.name, None)
                     continue
                 newest = max(f.stat().st_mtime for f in files)
                 if time.time() - newest > idle_seconds:
                     shutil.rmtree(d, ignore_errors=True)
+                    # Drop the sequence state too, or it accumulates one
+                    # entry per stream name for the life of the process.
+                    # A stream reaped and later revived starts a fresh
+                    # timeline anyway, so there is nothing to preserve.
+                    with SEQ_LOCK:
+                        SEQ_STATE.pop(d.name, None)
         except OSError:
             # A stream being written to concurrently can race us; next pass
             # will catch it.
@@ -499,6 +602,9 @@ def main():
                     help="largest accepted upload, in bytes")
     ap.add_argument("--reap-after", type=int, default=300,
                     help="delete a stream's directory after this many seconds idle")
+    ap.add_argument("--stale-after", type=int, default=15,
+                    help="serve the offline slate once ingest has been idle "
+                         "this many seconds (0 disables)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
