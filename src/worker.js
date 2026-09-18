@@ -360,11 +360,24 @@ export class LiveRoom {
     // and refuse to load fragments.
     const seq = segmentIndex(window[0]) ?? (this.mediaSequence + startIndex);
 
+    // Tell the player where to start. Without EXT-X-START, players pick their
+    // own entry point and conservative ones (AVPro/ExoPlayer) begin at the
+    // oldest segment in the window and then buffer further on top, which is
+    // what turns a 6s window into 20-30s of observed latency.
+    //
+    // Offset is negative = measured back from the live edge. Holding back
+    // ~2 segments leaves enough buffer to absorb jitter without the player
+    // starting far behind.
+    const startOffset = Math.min(
+      windowDuration(window, this.durations, this.targetDuration),
+      this.targetDuration * 2,
+    );
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
+      `#EXT-X-START:TIME-OFFSET=-${startOffset.toFixed(3)},PRECISE=YES`,
     ];
     if (this.discontinuitySequence > 0) {
       lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${this.discontinuitySequence}`);
@@ -437,6 +450,11 @@ export class LiveRoom {
 // =============================================================================
 // helpers
 // =============================================================================
+
+/** Total duration of a playlist window, for computing a live-edge offset. */
+function windowDuration(files, durations, fallback) {
+  return files.reduce((n, f) => n + (durations.get(f) ?? fallback), 0);
+}
 
 /** Extract ffmpeg's numeric counter from a segment filename, e.g. seg00042.ts -> 42. */
 function segmentIndex(file) {

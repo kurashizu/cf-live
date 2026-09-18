@@ -20,11 +20,11 @@ SEGMENT_DURATION = "1"
 
 # How many segments the DO keeps in memory. Must exceed PLAYLIST_SIZE so a
 # segment referenced by the playlist is never already evicted.
-MAX_SEGMENTS = "10"
+MAX_SEGMENTS = "8"
 
 # How many segments to advertise in the playlist. AVPro buffers roughly this
 # many before starting, so this is the dominant latency term.
-PLAYLIST_SIZE = "6"
+PLAYLIST_SIZE = "4"
 
 # Edge cache lifetime for immutable segments, in seconds.
 SEGMENT_CACHE_TTL = "30"
