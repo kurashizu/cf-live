@@ -150,8 +150,13 @@ export default {
       // can be as short as https://host/main. Checked last so real endpoints
       // always win, and served inline rather than redirected because some
       // players (AVPro among them) will not follow a 302 for a manifest.
+      // Only .m3u8 is stripped; any other extension stays part of the name, so
+      // /x.mpd would become a stream literally called "x.mpd". Reject names
+      // carrying a different extension rather than inventing a stream for a
+      // request that was clearly meant for something else.
       const alias = path.match(/^\/([^/]+?)(?:\.m3u8)?$/);
-      if (alias && !RESERVED_PATHS.has(alias[1].toLowerCase()) && isSafeName(alias[1])) {
+      if (alias && !RESERVED_PATHS.has(alias[1].toLowerCase())
+          && isSafeName(alias[1]) && !/\.[A-Za-z0-9]+$/.test(alias[1])) {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }

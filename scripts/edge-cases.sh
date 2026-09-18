@@ -165,6 +165,14 @@ curl -fsS "$BASE/robots.txt" 2>/dev/null | grep -q '^#EXTM3U' \
   && bad "/robots.txt served a playlist" \
   || ok "/robots.txt never serves a playlist (Cloudflare may inject its own)"
 
+# The alias route strips only .m3u8, so a path carrying any other extension
+# would otherwise become a stream literally named "x.mpd".
+for p in x.mpd foo.json bar.txt; do
+  C=$(code "$BASE/$p")
+  [ "$C" = "404" ] && ok "/$p is not treated as a stream ($C)" \
+                   || bad "/$p returned $C, inventing a stream for it"
+done
+
 sec "4. Ingest auth and input validation"
 [ "$(code -X PUT -d x "$BASE/ingest/wrongkey/x/seg1.ts")" = "403" ] \
   && ok "wrong key → 403" || bad "wrong key not rejected"
