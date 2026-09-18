@@ -82,6 +82,8 @@ export default {
         // high-value oracle, but avoid the trivial early-exit.
         if (!safeEqual(key, env.INGEST_KEY)) return text('forbidden', 403);
         if (!isSafeName(stream) || !isSafeName(file)) return text('bad name', 400);
+        // init.mp4 and .m4s arrive when the encoder is configured for fMP4,
+        // which is what DASH needs and HLS can also use via EXT-X-MAP.
 
         const ingested = await roomFetch(
           env, stream, request, `/ingest/${encodeURIComponent(file)}`);
@@ -98,6 +100,28 @@ export default {
       }
 
       // ---- playback --------------------------------------------------------
+      // /live/<stream>/manifest.mpd — DASH. Shares the fMP4 segments with
+      // HLS; only the manifest format differs.
+      const dash = path.match(/^\/live\/([^/]+)\/manifest\.mpd$/);
+      if (dash) {
+        const stream = dash[1];
+        if (!isSafeName(stream)) return text('bad name', 400);
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return text('method not allowed', 405);
+        }
+        return roomFetch(env, stream, request, '/dash');
+      }
+
+      // /<stream>.mpd — short alias for the DASH manifest.
+      const dashAlias = path.match(/^\/([^/]+)\.mpd$/);
+      if (dashAlias && !RESERVED_PATHS.has(dashAlias[1].toLowerCase())
+          && isSafeName(dashAlias[1])) {
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return text('method not allowed', 405);
+        }
+        return roomFetch(env, dashAlias[1], request, '/dash');
+      }
+
       // /live/<stream>/index.m3u8 — the media playlist a master points at.
       const media = path.match(/^\/live\/([^/]+)\/index\.m3u8$/);
       if (media) {
@@ -370,6 +394,8 @@ export class LiveRoom {
     this.totalSegments = 0;
     this.pendingDiscontinuity = false;
     this.sequenceBase = 0;
+    /** fMP4 initialisation segment, when the encoder sends one. */
+    this.initSegment = null;
 
     /**
      * Restore the metadata that must outlive eviction. Segments deliberately
@@ -382,6 +408,10 @@ export class LiveRoom {
      * otherwise overwrite everything restored here.
      */
     this.ready = state.blockConcurrencyWhile(async () => {
+      const init = await state.storage.get('init');
+      if (init) {
+        this.initSegment = { name: init.name, bytes: new Uint8Array(init.bytes) };
+      }
       const meta = await state.storage.get('meta');
       if (!meta) return;
       this.lastIngestAt = meta.lastIngestAt ?? 0;
@@ -403,6 +433,9 @@ export class LiveRoom {
     if (path.startsWith('/ingest/')) {
       const file = decodeURIComponent(path.slice('/ingest/'.length));
       return this.handleIngest(request, file);
+    }
+    if (path === '/dash') {
+      return this.handleDash(request.headers.get('x-cf-live-stream') || 'main');
     }
     if (path === '/playlist') {
       return this.handlePlaylist(request.headers.get('x-cf-live-stream') || 'main');
@@ -460,6 +493,19 @@ export class LiveRoom {
 
     const buf = new Uint8Array(await request.arrayBuffer());
     if (buf.byteLength === 0) return text('empty segment', 400);
+
+    // The fMP4 initialisation segment is not part of the timeline: it carries
+    // the decoder configuration and every media segment depends on it, so it
+    // is stored once and never evicted with the ring.
+    if (file === 'init.mp4' || file.endsWith('.mp4')) {
+      this.initSegment = { name: file, bytes: buf };
+      // Persist it, unlike media segments. It is a couple of kilobytes, it
+      // never changes during a broadcast, and every media segment is
+      // undecodable without it — so losing it to an eviction would break
+      // playback until the encoder happened to resend it.
+      await this.state.storage.put('init', { name: file, bytes: [...buf] });
+      return text('ok');
+    }
 
     this.segments.set(file, { bytes: buf, at: now });
     this.order.push(file);
@@ -575,13 +621,24 @@ export class LiveRoom {
     // interval does not match hls_time: segments then come out several times
     // longer than requested, and a fixed count would stretch the window to
     // tens of seconds and dominate the latency budget.
-    const window = trailingWindow(
-      this.order,
-      this.playlistSize,
-      this.durations,
-      this.targetDuration,
-      this.maxWindowSeconds,
-    );
+    // 'grow' advertises every buffered segment instead of a trailing window,
+    // so entries never disappear from the top of the list. Some players lose
+    // the timeline when the playlist they are following is truncated from the
+    // front, and this isolates that behaviour.
+    const mode = this.env.PLAYLIST_AS_VOD || '';
+    // Both modes advertise the entire buffer rather than a trailing window:
+    // 'grow' to test truncation, 'pseudovod' because a player that stops at
+    // ENDLIST should be handed as much media as possible before it does.
+    const growOnly = mode === 'grow' || mode === 'pseudovod';
+    const window = growOnly
+      ? this.order.slice()
+      : trailingWindow(
+          this.order,
+          this.playlistSize,
+          this.durations,
+          this.targetDuration,
+          this.maxWindowSeconds,
+        );
     const startIndex = this.order.length - window.length;
     // EXT-X-MEDIA-SEQUENCE must be monotonic across the whole life of the URL,
     // including the offline->live transition. The offline playlist numbers
@@ -600,19 +657,40 @@ export class LiveRoom {
     // point toward the live edge, but a stream carrying it would not play in
     // AVPro at all, and the window is only a few seconds long anyway — the
     // short window achieves the same latency without the tag.
-    // Debug switch: present the window as a finished VOD playlist. Used to
-    // isolate whether a player's failure is about live playlists specifically
-    // rather than about the media itself.
-    const asVod = this.env.PLAYLIST_AS_VOD === '1';
+    // PLAYLIST_AS_VOD isolates which part of a live playlist a player rejects:
+    //   '1'       -> PLAYLIST-TYPE:VOD plus ENDLIST (plays, but stops at the
+    //                end of the window)
+    //   'endlist' -> ENDLIST only, no PLAYLIST-TYPE
+    //   'type'    -> PLAYLIST-TYPE:EVENT, no ENDLIST
+    //   unset     -> a normal live playlist
+    const vodMode = this.env.PLAYLIST_AS_VOD || '';
+    const asVod = vodMode === '1';
+    // AVPro in VRChat will not follow a live playlist at all — verified by
+    // testing: the same segments play when the playlist carries ENDLIST and
+    // render black without it. 'pseudovod' therefore terminates every
+    // response with ENDLIST while still advancing the window, so such a
+    // player treats each poll as a short finished clip and keeps requesting
+    // the next one. Players that do handle live playlists are unaffected,
+    // since the content still moves forward.
+    const pseudoVod = vodMode === 'pseudovod';
     const lines = [
       '#EXTM3U',
-      '#EXT-X-VERSION:3',
+      // EXT-X-MAP requires version 7; plain TS segments only need 3.
+      `#EXT-X-VERSION:${this.initSegment ? 7 : 3}`,
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
     ];
     if (asVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
+    // EVENT means "segments are only ever appended" — a live playlist that
+    // some players follow more willingly than an untyped one.
+    else if (vodMode === 'type') lines.push('#EXT-X-PLAYLIST-TYPE:EVENT');
     if (this.discontinuitySequence > 0) {
       lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${this.discontinuitySequence}`);
+    }
+    // fMP4 segments are undecodable without the initialisation segment, so
+    // it has to be declared before the first media segment.
+    if (this.initSegment) {
+      lines.push(`#EXT-X-MAP:URI="${this.initSegment.name}"`);
     }
 
     for (const file of window) {
@@ -629,25 +707,102 @@ export class LiveRoom {
       // them.
       lines.push(file);
     }
-    if (asVod) lines.push('#EXT-X-ENDLIST');
+    if (asVod || pseudoVod || vodMode === 'endlist') lines.push('#EXT-X-ENDLIST');
     lines.push('');
 
     return new Response(lines.join('\n'), {
       headers: {
         'Content-Type': M3U8,
-        // The playlist MUST NOT be cached by the browser. hls.js treats a
-        // byte-identical live playlist as "nothing new" and declines to load
-        // any fragment, so a cached playlist stalls playback permanently.
-        // Edge collapsing is handled by the immutable segment cache instead.
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-        'Expires': '0',
+        // A live playlist must be revalidated on every poll, but *how* to say
+        // that differs by player. hls.js needs the response not to be reused
+        // from cache, or it sees an unchanged manifest and stops loading
+        // fragments. AVPro appears to read no-store as "do not fetch this
+        // again" and stops refreshing altogether, leaving black video.
+        //
+        // no-cache satisfies both: the response may be stored but must be
+        // revalidated before reuse, so every poll reaches the origin while
+        // still being a normal cacheable response.
+        'Cache-Control': 'no-cache, max-age=0, must-revalidate',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+
+  /**
+   * A DASH manifest over the same fMP4 segments HLS serves.
+   *
+   * Uses SegmentTimeline with explicit entries rather than a template with a
+   * computed number, because segment durations come from the encoder and are
+   * not perfectly uniform — a template would drift out of sync with reality.
+   */
+  handleDash(stream) {
+    const hasMedia = this.order.length > 0 && this.initSegment;
+    if (!hasMedia) {
+      // Nothing to describe yet. An empty but valid manifest keeps a player
+      // polling instead of treating the stream as broken.
+      return new Response(emptyMpd(this.targetDuration), {
+        headers: {
+          'Content-Type': 'application/dash+xml',
+          'Cache-Control': 'no-cache, max-age=0, must-revalidate',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+
+    const window = this.order.slice(-this.playlistSize);
+    const timescale = 1000;
+    const segments = window.map((file) => ({
+      file,
+      d: Math.round((this.durations.get(file) ?? this.targetDuration) * timescale),
+    }));
+    const total = segments.reduce((n, x) => n + x.d, 0);
+    // Publish time anchors the live edge; availabilityStartTime is when the
+    // broadcast began.
+    const start = new Date(this.startedAt || Date.now()).toISOString();
+    const now = new Date().toISOString();
+    const seqStart = segmentIndex(window[0]) ?? 0;
+
+    const timeline = segments
+      .map((x, i) => (i === 0 ? `<S t="0" d="${x.d}"/>` : `<S d="${x.d}"/>`))
+      .join('');
+    const urls = segments
+      .map((x) => `<SegmentURL media="${x.file}"/>`)
+      .join('');
+
+    const mpd = `<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" minimumUpdatePeriod="PT${this.targetDuration}S" availabilityStartTime="${start}" publishTime="${now}" minBufferTime="PT${(this.targetDuration * 2).toFixed(1)}S" timeShiftBufferDepth="PT${(total / timescale).toFixed(1)}S">
+  <Period id="0" start="PT0S">
+    <AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
+      <Representation id="v" codecs="avc1.4d401f,mp4a.40.2" bandwidth="1500000">
+        <SegmentList timescale="${timescale}" duration="${Math.round(this.targetDuration * timescale)}" startNumber="${seqStart}">
+          <Initialization sourceURL="${this.initSegment.name}"/>
+          ${urls}
+        </SegmentList>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+`;
+    return new Response(mpd, {
+      headers: {
+        'Content-Type': 'application/dash+xml',
+        'Cache-Control': 'no-cache, max-age=0, must-revalidate',
         'Access-Control-Allow-Origin': '*',
       },
     });
   }
 
   handleSegmentRead(file) {
+    if (this.initSegment && file === this.initSegment.name) {
+      return new Response(this.initSegment.bytes, {
+        headers: {
+          'Content-Type': 'video/mp4',
+          'Content-Length': String(this.initSegment.bytes.byteLength),
+          'Cache-Control': 'public, max-age=60',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
     const seg = this.segments.get(file);
     if (!seg) return text('segment not found', 404);
     return new Response(seg.bytes, {
@@ -742,6 +897,15 @@ function segmentIndex(file) {
   if (!file) return null;
   const m = file.match(/(\d+)(?=\.[^.]+$)/);
   return m ? parseInt(m[1], 10) : null;
+}
+
+/** A valid but empty DASH manifest, for a stream with nothing ingested yet. */
+function emptyMpd(targetDuration) {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" minimumUpdatePeriod="PT${targetDuration}S" availabilityStartTime="${new Date().toISOString()}" minBufferTime="PT${(targetDuration * 2).toFixed(1)}S">
+  <Period id="0" start="PT0S"/>
+</MPD>
+`;
 }
 
 /** Consume and discard a request body so no stream is left unread. */

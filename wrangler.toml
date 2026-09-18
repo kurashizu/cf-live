@@ -20,7 +20,7 @@ SEGMENT_DURATION = "2"
 
 # How many segments the DO keeps in memory. Must exceed PLAYLIST_SIZE so a
 # segment referenced by the playlist is never already evicted.
-MAX_SEGMENTS = "6"
+MAX_SEGMENTS = "8"
 
 # How many segments to advertise in the playlist. AVPro buffers roughly this
 # many before starting, so this is the dominant latency term.
@@ -43,6 +43,9 @@ OFFLINE_CACHE_TTL = "3"
 # video/mp2t; several reference streams that play correctly in AVPro use it,
 # and video/mp2t appears to route some players into a demuxer path that fails.
 SEGMENT_CONTENT_TYPE = "octet"
+
+# Debug: present the live window as a finished VOD playlist.
+PLAYLIST_AS_VOD = ""
 
 # Edge cache lifetime for immutable segments, in seconds.
 SEGMENT_CACHE_TTL = "30"
