@@ -253,7 +253,16 @@ scripts/edge-cases.sh https://<your-worker> "$INGEST_KEY"
 ## Offline behaviour
 
 A stream with no live content serves a playable "OFFLINE / WAITING FOR STREAM"
-slate rather than an empty playlist. Viewers see why there is no picture, and
+slate rather than an empty playlist. It carries a `KRSZ LIVE` watermark, a
+`KRSZ.IN` footer, and a looping sweep animation so viewers can tell the feed is
+alive and simply not broadcasting yet.
+
+Regenerate it with `scripts/make-slate.sh` after editing `scripts/slate.py`.
+The animation is a ping-pong sweep driven by a cosine, so velocity is zero at
+both ends of the 2s segment and the loop point is continuous in both position
+and motion — no visible jerk each time a player repeats it. Frames are drawn by
+a pure-Python PNG writer with a 5x7 bitmap font, so generation needs no fonts,
+no Pillow, and no ffmpeg `drawtext` (absent from many builds). Viewers see why there is no picture, and
 because the slate is identical on every request it can be cached at the edge —
 which is what keeps idle viewers from draining the request quota.
 
