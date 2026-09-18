@@ -39,5 +39,10 @@ MAX_WINDOW_SECONDS = "8"
 # worst-case delay before a viewer sees the stream has begun.
 OFFLINE_CACHE_TTL = "3"
 
+# Media type for segments. "octet" serves application/octet-stream instead of
+# video/mp2t; several reference streams that play correctly in AVPro use it,
+# and video/mp2t appears to route some players into a demuxer path that fails.
+SEGMENT_CONTENT_TYPE = "octet"
+
 # Edge cache lifetime for immutable segments, in seconds.
 SEGMENT_CACHE_TTL = "30"

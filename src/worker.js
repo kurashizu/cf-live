@@ -29,7 +29,12 @@ const RESERVED_PATHS = new Set([
   '.well-known',
 ]);
 
+// MPEG-TS media type for segments. video/mp2t is correct, but some players
+// route on it into a demuxer path that handles our segments poorly, so this
+// is configurable to allow testing against octet-stream — which is what
+// several reference streams that do play actually serve.
 const TS = 'video/mp2t';
+const TS_ALT = 'application/octet-stream';
 const M3U8 = 'application/vnd.apple.mpegurl';
 
 export default {
@@ -40,6 +45,30 @@ export default {
     try {
       if (path === '/' || path === '/index.html') return landingPage(url, env);
       if (path === '/healthz') return text('ok');
+
+      // Diagnostic: the simplest possible playable stream — one segment,
+      // fixed content, marked as finished. If a player cannot render this,
+      // the problem is not in the live pipeline.
+      if (path === '/_selftest.m3u8' || path === '/_selftest') {
+        const body = [
+          '#EXTM3U',
+          '#EXT-X-VERSION:3',
+          '#EXT-X-PLAYLIST-TYPE:VOD',
+          `#EXT-X-TARGETDURATION:${Math.ceil(SLATE_DURATION)}`,
+          '#EXT-X-MEDIA-SEQUENCE:0',
+          `#EXTINF:${SLATE_DURATION.toFixed(6)},`,
+          `live/_offline.${SLATE_VERSION}.0.ts`,
+          '#EXT-X-ENDLIST',
+          '',
+        ].join('\n');
+        return new Response(body, {
+          headers: {
+            'Content-Type': M3U8,
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
 
       // ---- ingest ----------------------------------------------------------
       // /ingest/<key>/<stream>/<file>
@@ -180,7 +209,7 @@ async function serveSegment(env, stream, file, request, ctx) {
   const bytes = await res.arrayBuffer();
   const ttl = intVar(env.SEGMENT_CACHE_TTL, 30);
   const headers = {
-    'Content-Type': TS,
+    'Content-Type': env.SEGMENT_CONTENT_TYPE === 'octet' ? TS_ALT : TS,
     'Content-Length': String(bytes.byteLength),
     // Segments never change once written, so this is always safe and means a
     // region only pulls from the single-colo DO once per segment.
@@ -411,9 +440,13 @@ export class LiveRoom {
     // continues past whatever the offline playlist had reached rather than
     // restarting at zero. The margin covers the window the offline playlist
     // was advertising when the switch happened.
-    if (!this.sequenceBase) {
-      this.sequenceBase = offlineSequence() + this.playlistSize + 1;
-    }
+    // Deliberately NOT continuing from the offline sequence. Doing so kept the
+    // numbering monotonic across the offline->live switch, but it also meant
+    // a live playlist opened at a sequence in the hundreds of thousands, and
+    // AVPro renders such a stream as black video. Reference streams that play
+    // correctly either omit the tag or start near zero, so live numbering
+    // starts from the encoder's own counter.
+    if (!this.sequenceBase) this.sequenceBase = 0;
     this.lastIngestAt = now;
 
     if (file.endsWith('.m3u8')) {
@@ -567,12 +600,17 @@ export class LiveRoom {
     // point toward the live edge, but a stream carrying it would not play in
     // AVPro at all, and the window is only a few seconds long anyway — the
     // short window achieves the same latency without the tag.
+    // Debug switch: present the window as a finished VOD playlist. Used to
+    // isolate whether a player's failure is about live playlists specifically
+    // rather than about the media itself.
+    const asVod = this.env.PLAYLIST_AS_VOD === '1';
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
     ];
+    if (asVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
     if (this.discontinuitySequence > 0) {
       lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${this.discontinuitySequence}`);
     }
@@ -591,6 +629,7 @@ export class LiveRoom {
       // them.
       lines.push(file);
     }
+    if (asVod) lines.push('#EXT-X-ENDLIST');
     lines.push('');
 
     return new Response(lines.join('\n'), {
