@@ -332,6 +332,33 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
+def reap_stale(root: Path, idle_seconds: int, interval: int = 60):
+    """Delete stream directories nobody has written to for a while.
+
+    ffmpeg's delete_segments only prunes its own sliding window, so whatever
+    was in flight when a broadcast ended stays on disk. On a tmpfs that is
+    memory held for no reason, and it accumulates one stream at a time.
+    """
+    import time
+    while True:
+        time.sleep(interval)
+        try:
+            for d in root.iterdir():
+                if not d.is_dir() or d.name == "offline":
+                    continue
+                files = list(d.iterdir())
+                if not files:
+                    d.rmdir()
+                    continue
+                newest = max(f.stat().st_mtime for f in files)
+                if time.time() - newest > idle_seconds:
+                    shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            # A stream being written to concurrently can race us; next pass
+            # will catch it.
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=9999)
@@ -347,6 +374,8 @@ def main():
     ap.add_argument("--slate-window", type=int, default=3)
     ap.add_argument("--max-body", type=int, default=32 * 1024 * 1024,
                     help="largest accepted upload, in bytes")
+    ap.add_argument("--reap-after", type=int, default=300,
+                    help="delete a stream's directory after this many seconds idle")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -355,6 +384,12 @@ def main():
 
     CONFIG.update(vars(args))
     Path(args.root).mkdir(parents=True, exist_ok=True)
+
+    if args.reap_after > 0:
+        threading.Thread(
+            target=reap_stale, args=(Path(args.root), args.reap_after),
+            daemon=True,
+        ).start()
 
     # ThreadingHTTPServer: a stalled viewer must not block ingest, and
     # segments are served concurrently.

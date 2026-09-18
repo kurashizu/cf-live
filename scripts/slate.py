@@ -128,7 +128,7 @@ def render(frame):
     # independently centred strings.
     WM_X, WM_SCALE = 40, 2
     brand = "KRSZ LIVE"
-    tag = "PURELY SERVERLESS"
+    tag = "HIGH PERFORMANCE"
     brand_w = text_width(brand, WM_SCALE, 1)
     # Solve for the tracking that makes the tagline span the same width:
     #   len*(5+t)*s - t*s = brand_w  ->  t = (brand_w/s - 5*len) / (len - 1)
