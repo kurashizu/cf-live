@@ -30,7 +30,7 @@ curl -fsS "$BASE/healthz" >/dev/null && ok "/healthz reachable" || { bad "/healt
 echo "publishing ${SEG_DUR}s segments"
 ffmpeg -hide_banner -loglevel error -re \
   -f lavfi -i "testsrc2=size=1280x720:rate=$FPS" \
-  -f lavfi -i "sine=frequency=440" -t 90 \
+  -f lavfi -i "sine=frequency=440" -t 180 \
   -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -bf 0 \
   -g $((FPS*SEG_DUR)) -keyint_min $((FPS*SEG_DUR)) -sc_threshold 0 \
   -b:v 2500k -pix_fmt yuv420p \
@@ -53,8 +53,17 @@ done
 
 echo
 echo "playlist"
+# The short routes return a master playlist naming one variant; the tags below
+# live in the media playlist it points at, so follow it the way a player does.
+MASTER="$TMP/master.m3u8"
+curl -fsS "$BASE/$STREAM.m3u8" -o "$MASTER" && ok "master playlist served" \
+                                            || bad "master playlist failed"
+grep -q 'EXT-X-STREAM-INF' "$MASTER" 2>/dev/null \
+  && ok "master declares a variant" || bad "master has no variant"
+
 PL="$TMP/pl.m3u8"
-curl -fsS "$BASE/live/$STREAM.m3u8" -o "$PL" && ok "playlist served" || bad "playlist failed"
+curl -fsS "$BASE/live/$STREAM/index.m3u8" -o "$PL" && ok "media playlist served" \
+                                                   || bad "media playlist failed"
 grep -q '^#EXTM3U'                 "$PL" && ok "has #EXTM3U"          || bad "missing #EXTM3U"
 grep -q '#EXT-X-TARGETDURATION'    "$PL" && ok "has TARGETDURATION"   || bad "missing TARGETDURATION"
 grep -q '#EXT-X-MEDIA-SEQUENCE'    "$PL" && ok "has MEDIA-SEQUENCE"   || bad "missing MEDIA-SEQUENCE"
@@ -71,9 +80,9 @@ FIRST=${FIRST:-0}
 
 echo
 echo "caching headers"
-curl -fsSI "$BASE/live/$STREAM.m3u8" | grep -qi 'cache-control:.*no-store' \
-  && ok "playlist is no-store" || bad "playlist is cacheable (stalls hls.js)"
-SEGFILE=$(grep -m1 -oE "[^/]*seg[0-9]+\.ts" "$PL")
+curl -fsSI "$BASE/live/$STREAM/index.m3u8" | grep -qi 'cache-control:.*no-store' \
+  && ok "media playlist is no-store" || bad "media playlist is cacheable (stalls hls.js)"
+SEGFILE=$(grep -m1 -oE "^seg[0-9]+\.ts" "$PL")
 curl -fsSI "$BASE/live/$STREAM/$SEGFILE" | grep -qi 'cache-control:.*immutable' \
   && ok "segments are immutable" || bad "segments not immutable"
 

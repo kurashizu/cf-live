@@ -12,7 +12,11 @@ export function landingPage(url, env) {
   const segDur = Number(env?.SEGMENT_DURATION ?? 1);
   const playlistSize = Number(env?.PLAYLIST_SIZE ?? 6);
   const maxSegs = Number(env?.MAX_SEGMENTS ?? 10);
-  const estLatency = segDur * 3 + 1;
+  // Measured, not guessed: one segment to encode, ~0.6s to upload, the window
+  // depth a player starts behind by, plus its own 2-3s buffer.
+  const estLow = segDur + 0.6 + (playlistSize - 1) * segDur + 2;
+  const estHigh = estLow + 1.5;
+  const estLatency = `${estLow.toFixed(1)}-${estHigh.toFixed(1)}`;
 
   return new Response(html({ origin, segDur, playlistSize, maxSegs, estLatency }), {
     headers: {
@@ -413,10 +417,27 @@ configuration required.</p>
 </p>
 
 <div class="note">
-  <b>Why latency stops here:</b> HLS latency ≈ segment duration × segments buffered
-  by the player. Going lower needs LL-HLS partial segments, which AVPro does not
-  reliably support, so ${segDur}s segments are the practical floor on this path.
-  Sub-second delivery requires WebRTC, and the VRChat video players cannot consume it.
+  <b>Where the latency goes:</b> one segment to encode (${segDur}s, unavoidable),
+  ~0.6s to upload, ${((playlistSize - 1) * segDur).toFixed(1)}s of window depth
+  because a player starts at the oldest advertised segment, and 2-3s of the
+  player's own buffer. <b>Playlist window</b> is the knob that matters — each
+  extra segment costs about ${segDur}s.
+  <br><br>
+  A player's own latency readout measures only the distance to the live edge
+  and excludes encoding and upload, so it reads several seconds lower than what
+  a viewer actually sees. Going below ~3.5s needs LL-HLS partial segments,
+  which AVPro does not reliably support; sub-second needs WebRTC, which the
+  VRChat players cannot consume.
+</div>
+
+<div class="note">
+  <b>VRChat under Proton renders live streams as black.</b> AVPro delegates
+  decoding to Windows Media Foundation, and Proton's translation handles
+  video-on-demand but not the continuous playlist re-reading a live stream
+  needs. Set <code>PSEUDO_VOD = "1"</code> to make playlists end with
+  <code>ENDLIST</code>, which such a player will decode — at the cost of
+  playback stopping at the end of the window and not resuming. On Windows,
+  leave it off.
 </div>
 
 <footer>cf-live · runs within the Cloudflare Workers free tier ·

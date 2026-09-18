@@ -47,42 +47,6 @@ export default {
       if (path === '/' || path === '/index.html') return landingPage(url, env);
       if (path === '/healthz') return text('ok');
 
-      // Diagnostic: a live playlist served from the root, mirroring the layout
-      // of /_selftest.m3u8 (which plays) rather than /live/<s>/index.m3u8
-      // (which does not). Isolates whether the URL depth or the relative
-      // segment URIs matter to the player.
-      const flat = path.match(/^\/_flat_([A-Za-z0-9._-]+)\.m3u8$/);
-      if (flat) {
-        if (request.method !== 'GET' && request.method !== 'HEAD') {
-          return text('method not allowed', 405);
-        }
-        return roomFetch(env, flat[1], request, '/playlist?flat=1');
-      }
-
-      // Diagnostic: the simplest possible playable stream — one segment,
-      // fixed content, marked as finished. If a player cannot render this,
-      // the problem is not in the live pipeline.
-      if (path === '/_selftest.m3u8' || path === '/_selftest') {
-        const body = [
-          '#EXTM3U',
-          '#EXT-X-VERSION:3',
-          '#EXT-X-PLAYLIST-TYPE:VOD',
-          `#EXT-X-TARGETDURATION:${Math.ceil(SLATE_DURATION)}`,
-          '#EXT-X-MEDIA-SEQUENCE:0',
-          `#EXTINF:${SLATE_DURATION.toFixed(3)}, no desc`,
-          `live/_offline.${SLATE_VERSION}.0.ts`,
-          '#EXT-X-ENDLIST',
-          '',
-        ].join('\n');
-        return new Response(body, {
-          headers: {
-            'Content-Type': M3U8,
-            'Cache-Control': 'no-store',
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
-      }
-
       // ---- ingest ----------------------------------------------------------
       // /ingest/<key>/<stream>/<file>
       const ingest = path.match(/^\/ingest\/([^/]+)\/([^/]+)\/([^/]+)$/);
@@ -113,28 +77,6 @@ export default {
       }
 
       // ---- playback --------------------------------------------------------
-      // /live/<stream>/manifest.mpd — DASH. Shares the fMP4 segments with
-      // HLS; only the manifest format differs.
-      const dash = path.match(/^\/live\/([^/]+)\/manifest\.mpd$/);
-      if (dash) {
-        const stream = dash[1];
-        if (!isSafeName(stream)) return text('bad name', 400);
-        if (request.method !== 'GET' && request.method !== 'HEAD') {
-          return text('method not allowed', 405);
-        }
-        return roomFetch(env, stream, request, '/dash');
-      }
-
-      // /<stream>.mpd — short alias for the DASH manifest.
-      const dashAlias = path.match(/^\/([^/]+)\.mpd$/);
-      if (dashAlias && !RESERVED_PATHS.has(dashAlias[1].toLowerCase())
-          && isSafeName(dashAlias[1])) {
-        if (request.method !== 'GET' && request.method !== 'HEAD') {
-          return text('method not allowed', 405);
-        }
-        return roomFetch(env, dashAlias[1], request, '/dash');
-      }
-
       // /live/<stream>/index.m3u8 — the media playlist a master points at.
       const media = path.match(/^\/live\/([^/]+)\/index\.m3u8$/);
       if (media) {
@@ -284,9 +226,11 @@ function masterPlaylist(stream, env) {
     // between the declaration and the actual bitstream is a plausible cause
     // of a black picture with otherwise healthy playback.
     '#EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1',
-    // Relative to wherever the master was fetched from, which is always one
-    // level above /live/<stream>/.
-    `live/${encodeURIComponent(stream)}/index.m3u8${bust}`,
+    // Root-absolute. The master is reachable at two different depths
+    // (/<stream> and /live/<stream>.m3u8), so no single relative path
+    // resolves correctly from both — from the latter, "live/x/index.m3u8"
+    // becomes /live/live/x/index.m3u8 and 404s.
+    `/live/${encodeURIComponent(stream)}/index.m3u8${bust}`,
     '',
   ].join('\n');
   return new Response(body, {
@@ -459,14 +403,8 @@ export class LiveRoom {
       const file = decodeURIComponent(path.slice('/ingest/'.length));
       return this.handleIngest(request, file);
     }
-    if (path === '/dash') {
-      return this.handleDash(request.headers.get('x-cf-live-stream') || 'main');
-    }
     if (path === '/playlist') {
-      return this.handlePlaylist(
-        request.headers.get('x-cf-live-stream') || 'main',
-        url.searchParams.get('flat') === '1',
-      );
+      return this.handlePlaylist(request.headers.get('x-cf-live-stream') || 'main');
     }
     if (path.startsWith('/segment/')) {
       const file = decodeURIComponent(path.slice('/segment/'.length));
@@ -597,7 +535,7 @@ export class LiveRoom {
 
   // --- playback -------------------------------------------------------------
 
-  handlePlaylist(stream, flat = false) {
+  handlePlaylist(stream) {
     // Count polls so a test can tell whether a player re-requests the
     // playlist after reaching the end, or fetches it once and stops.
     this.playlistHits = (this.playlistHits || 0) + 1;
@@ -704,12 +642,7 @@ export class LiveRoom {
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
     ];
-    // Split for diagnosis: a player that needs one of these but not the
-    // other tells us whether it is refusing to poll (ENDLIST) or refusing to
-    // treat the stream as seekable (PLAYLIST-TYPE).
-    if (pseudoVod || this.env.FORCE_VOD_TYPE === '1') {
-      lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
-    }
+    if (pseudoVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
     // EXT-X-DISCONTINUITY-SEQUENCE is deliberately not emitted. A restart
     // clears the ring, so the window always holds one continuous timeline and
     // never contains an EXT-X-DISCONTINUITY to count. Publishing a non-zero
@@ -744,11 +677,9 @@ export class LiveRoom {
       // /live/<stream>/<file>. Root-absolute paths are what every working
       // reference stream avoids, and AVPro would not play a playlist using
       // them.
-      // In flat mode the playlist is served from the root, so segment URIs
-      // need the full path rather than a bare filename.
-      lines.push(flat ? `live/${encodeURIComponent(stream)}/${file}` : file);
+      lines.push(file);
     });
-    if (pseudoVod || this.env.FORCE_ENDLIST === '1') lines.push('#EXT-X-ENDLIST');
+    if (pseudoVod) lines.push('#EXT-X-ENDLIST');
     lines.push('');
 
     return new Response(lines.join('\n'), {
@@ -760,70 +691,6 @@ export class LiveRoom {
         // so a player was free to reuse its first copy and never see the
         // stream advance.
         'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-
-  /**
-   * A DASH manifest over the same fMP4 segments HLS serves.
-   *
-   * Uses SegmentTimeline with explicit entries rather than a template with a
-   * computed number, because segment durations come from the encoder and are
-   * not perfectly uniform — a template would drift out of sync with reality.
-   */
-  handleDash(stream) {
-    const hasMedia = this.order.length > 0 && this.initSegment;
-    if (!hasMedia) {
-      // Nothing to describe yet. An empty but valid manifest keeps a player
-      // polling instead of treating the stream as broken.
-      return new Response(emptyMpd(this.targetDuration), {
-        headers: {
-          'Content-Type': 'application/dash+xml',
-          'Cache-Control': 'no-cache, max-age=0, must-revalidate',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-    }
-
-    const window = this.order.slice(-this.playlistSize);
-    const timescale = 1000;
-    const segments = window.map((file) => ({
-      file,
-      d: Math.round((this.durations.get(file) ?? this.targetDuration) * timescale),
-    }));
-    const total = segments.reduce((n, x) => n + x.d, 0);
-    // Publish time anchors the live edge; availabilityStartTime is when the
-    // broadcast began.
-    const start = new Date(this.startedAt || Date.now()).toISOString();
-    const now = new Date().toISOString();
-    const seqStart = segmentIndex(window[0]) ?? 0;
-
-    const timeline = segments
-      .map((x, i) => (i === 0 ? `<S t="0" d="${x.d}"/>` : `<S d="${x.d}"/>`))
-      .join('');
-    const urls = segments
-      .map((x) => `<SegmentURL media="${x.file}"/>`)
-      .join('');
-
-    const mpd = `<?xml version="1.0" encoding="utf-8"?>
-<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" minimumUpdatePeriod="PT${this.targetDuration}S" availabilityStartTime="${start}" publishTime="${now}" minBufferTime="PT${(this.targetDuration * 2).toFixed(1)}S" timeShiftBufferDepth="PT${(total / timescale).toFixed(1)}S">
-  <Period id="0" start="PT0S">
-    <AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
-      <Representation id="v" codecs="avc1.4d401f,mp4a.40.2" bandwidth="1500000">
-        <SegmentList timescale="${timescale}" duration="${Math.round(this.targetDuration * timescale)}" startNumber="${seqStart}">
-          <Initialization sourceURL="${this.initSegment.name}"/>
-          ${urls}
-        </SegmentList>
-      </Representation>
-    </AdaptationSet>
-  </Period>
-</MPD>
-`;
-    return new Response(mpd, {
-      headers: {
-        'Content-Type': 'application/dash+xml',
-        'Cache-Control': 'no-cache, max-age=0, must-revalidate',
         'Access-Control-Allow-Origin': '*',
       },
     });
@@ -940,15 +807,6 @@ function segmentIndex(file) {
   if (!file) return null;
   const m = file.match(/(\d+)(?=\.[^.]+$)/);
   return m ? parseInt(m[1], 10) : null;
-}
-
-/** A valid but empty DASH manifest, for a stream with nothing ingested yet. */
-function emptyMpd(targetDuration) {
-  return `<?xml version="1.0" encoding="utf-8"?>
-<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" minimumUpdatePeriod="PT${targetDuration}S" availabilityStartTime="${new Date().toISOString()}" minBufferTime="PT${(targetDuration * 2).toFixed(1)}S">
-  <Period id="0" start="PT0S"/>
-</MPD>
-`;
 }
 
 /** Consume and discard a request body so no stream is left unread. */

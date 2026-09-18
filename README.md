@@ -61,7 +61,7 @@ Settings → Output → Output Mode: **Advanced** → **Recording** tab:
 | FFmpeg Output Type | `Output to URL` |
 | File path or URL | `https://<your-worker>/ingest/<KEY>/main/live.m3u8` |
 | Container Format | `hls` |
-| **Keyframe interval (frames)** | **`60`** — see below, this one controls latency |
+| **Keyframe interval (frames)** | **`30`** — see below, this one controls latency |
 | Video Bitrate | `2500` Kbps |
 | Video Encoder | `libx264` |
 | Audio Encoder | `aac` |
@@ -69,18 +69,18 @@ Settings → Output → Output Mode: **Advanced** → **Recording** tab:
 **Muxer Settings** (one line):
 
 ```
-method=PUT http_persistent=1 ignore_io_errors=1 hls_time=2 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<your-worker>/ingest/<KEY>/main/seg%05d.ts
+method=PUT http_persistent=1 ignore_io_errors=1 hls_time=1 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<your-worker>/ingest/<KEY>/main/seg%05d.ts
 ```
 
 **Keyframe interval** is the setting that actually determines latency, and OBS
 gets it wrong by default.
 
 A segment can only be cut on a keyframe. OBS ships with **249** frames in the
-`Keyframe interval (frames)` field, which is ~8s at 30 fps — so `hls_time=2` is
-ignored and you get 8s segments. That alone turns a 2s configuration into
+`Keyframe interval (frames)` field, which is ~8s at 30 fps — so `hls_time=1` is
+ignored and you get 8s segments. That alone turns a 1s configuration into
 20-30s of observed latency.
 
-Set it to **frame rate × segment duration**: `60` at 30 fps, `120` at 60 fps.
+Set it to **frame rate × segment duration**: `30` at 30 fps, `60` at 60 fps.
 
 > The `Keyframe interval (frames)` field is a separate numeric input in the
 > FFmpeg output panel, and it overrides any `g=` written in Video Encoder
@@ -164,43 +164,69 @@ A wrong key returns `403`. Stream and file names are restricted to
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SEGMENT_DURATION` | `2` | Seconds per segment. Must match OBS's `hls_time`. |
-| `MAX_SEGMENTS` | `6` | Segments held in memory. Raised automatically to `PLAYLIST_SIZE + 1` if set lower. |
-| `PLAYLIST_SIZE` | `4` | Segments advertised in the playlist. |
-| `MAX_WINDOW_SECONDS` | `8` | Ceiling on how many seconds the playlist may span. Guards startup latency when the encoder emits segments longer than `SEGMENT_DURATION`. |
-| `SEGMENT_CACHE_TTL` | `30` | Edge cache lifetime for immutable segments. |
+| `SEGMENT_DURATION` | `1` | Seconds per segment. Must match OBS's `hls_time` **and** its keyframe interval. |
+| `PLAYLIST_SIZE` | `3` | Segments advertised. The dominant latency term. |
+| `MAX_SEGMENTS` | `8` | Segments held in memory. Raised to `PLAYLIST_SIZE + 1` if set lower. Sets both jitter tolerance and worst-case latency. |
+| `MAX_WINDOW_SECONDS` | `6` | Ceiling on playlist span, guarding latency when segments come out longer than requested. |
+| `OFFLINE_CACHE_TTL` | `3` | Edge cache for the offline playlist; worst case before a viewer notices a broadcast started. |
+| `SEGMENT_CACHE_TTL` | `30` | Edge cache for immutable segments. |
+| `PSEUDO_VOD` | `0` | Terminate playlists with `ENDLIST` for players that cannot follow a live playlist. See VRChat compatibility. |
 
-## Latency and tolerance
+## Latency
 
-Two different numbers, set by two different knobs:
-
-**Startup latency** — how far behind a viewer begins — is bounded by
-`PLAYLIST_SIZE`, since a player can only start on a segment the playlist
-advertises. At the defaults (2s segments, 4 advertised):
+Measured end to end at the defaults (1s segments, 3 advertised):
 
 | | |
 |---|---|
-| Encoder fills one segment | 2.0s (unavoidable) |
-| Upload until readable | ~0.5s (measured 0.04–0.85s) |
-| Player honours `EXT-X-START` | **~5.5s total** |
-| Player starts at the oldest advertised segment | **~8.5s total** |
+| Encoder fills one segment | 1.0s (unavoidable) |
+| Upload until readable | ~0.6s |
+| Window depth — oldest to newest entry | 2.0s |
+| Player's own buffer | 2-3s |
+| **Total** | **~3.6-6.6s** |
 
-**Worst-case steady-state latency** — how far behind a viewer may drift and
-still keep playing — equals the tolerance window, `MAX_SEGMENTS × segment
-duration`, because that is how much history stays in memory. At the defaults
-that is 12s of tolerance, so ~14.5s worst case.
+Note that a player's own latency readout (hls.js `latency`, and the figure in
+the preview UI) measures only the distance to the live edge and excludes
+encoding and upload, so it reads several seconds lower than what a viewer
+actually experiences.
 
-These conflict directly: a deeper ring absorbs more network jitter without a
-rebuffer, but also lets a viewer sit further behind. The default is
-deliberately shallow — for a shared watch session, a straggler rebuffering and
-catching up beats them drifting 30s behind everyone else.
-
-Note that drift is the player's choice, not the server's. A viewer on a good
-connection always tracks the live edge, and never requests the deeper segments
-at all.
-
-Going below ~5s requires LL-HLS partial segments, which AVPro does not reliably
+`PLAYLIST_SIZE` is the knob that matters: a player starts at the oldest
+advertised segment, so each extra entry costs about one segment of delay.
+Going below ~3.5s needs LL-HLS partial segments, which AVPro does not reliably
 support; sub-second needs WebRTC, which the VRChat players cannot consume.
+
+**Keyframe interval must match.** `SEGMENT_DURATION` is a request, not a
+guarantee — segments can only be cut on a keyframe, so an encoder with a
+longer keyframe interval produces longer segments and proportionally more
+latency, whatever this is set to. `MAX_WINDOW_SECONDS` caps the damage but
+does not prevent it.
+
+## Tolerance
+
+`MAX_SEGMENTS x SEGMENT_DURATION` is how far behind a viewer may drift and
+still find the segment they want — so it is simultaneously the jitter
+tolerance and the worst-case latency. The default of 8 gives 8s of both.
+
+Drift is the player's choice, not the server's: a viewer on a good connection
+tracks the live edge and never requests the deeper segments at all. A shallow
+ring makes a straggler rebuffer and catch up rather than sit far behind
+everyone else, which suits a shared watch session.
+
+## VRChat compatibility
+
+Verified working: browsers (hls.js), ffmpeg, and VRChat on Windows.
+
+**VRChat under Proton does not play live streams.** AVPro delegates decoding to
+Windows Media Foundation, and Proton's translation of it handles
+video-on-demand but not the continuous playlist re-reading a live stream
+requires. The symptom is video that loads and then stays black, while the same
+segments play fine once the playlist claims to be finished.
+
+If you need playback there, set `PSEUDO_VOD = "1"`. Every playlist then ends
+with `ENDLIST`, which such a player will decode. The limitation is not
+worked around, only traded: playback stops at the end of the window and does
+not resume, because a player that has seen `ENDLIST` stops issuing requests
+entirely — verified by counting polls server-side, five requests and then
+nothing. On Windows, leave it off.
 
 ## Design notes
 
@@ -228,9 +254,9 @@ restarts, and a mismatch makes players miscompute the live edge.
 ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
        -f lavfi -i sine=frequency=440 \
   -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -bf 0 \
-  -g 60 -keyint_min 60 -sc_threshold 0 -b:v 2500k -pix_fmt yuv420p \
+  -g 30 -keyint_min 30 -sc_threshold 0 -b:v 2500k -pix_fmt yuv420p \
   -c:a aac -b:a 128k -ar 48000 -ac 2 \
-  -f hls -hls_time 2 -hls_list_size 6 \
+  -f hls -hls_time 1 -hls_list_size 6 \
   -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
   -method PUT -http_persistent 1 -ignore_io_errors 1 \
   -hls_segment_filename "http://localhost:8787/ingest/$INGEST_KEY/main/seg%05d.ts" \

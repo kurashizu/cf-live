@@ -2,7 +2,7 @@ name = "cf-live"
 main = "src/worker.js"
 compatibility_date = "2025-09-01"
 
-# Durable Object holds the in-memory segment ring buffer for each stream.
+# One Durable Object per stream, holding that stream's segments in memory.
 [[durable_objects.bindings]]
 name = "LIVE_ROOM"
 class_name = "LiveRoom"
@@ -14,47 +14,46 @@ tag = "v1"
 new_sqlite_classes = ["LiveRoom"]
 
 [vars]
-# Segment duration in seconds. Must match OBS's hls_time.
-# Lower = less latency, more requests. 1 is the practical floor.
-SEGMENT_DURATION = "2"
+# Seconds per segment. Must match OBS's hls_time *and* its keyframe interval
+# (frame rate x this value), or segments come out however long the keyframes
+# allow and latency follows them.
+SEGMENT_DURATION = "1"
 
-# How many segments the DO keeps in memory. Must exceed PLAYLIST_SIZE so a
-# segment referenced by the playlist is never already evicted.
+# Segments advertised in the playlist. This is the dominant latency term: a
+# player starts at the oldest entry, so each extra segment costs about one
+# SEGMENT_DURATION of delay.
+PLAYLIST_SIZE = "3"
+
+# Segments held in memory. Raised automatically to PLAYLIST_SIZE + 1 if set
+# lower. This is how far behind a viewer may drift before the segment they
+# want is gone — i.e. the worst-case latency, and the tolerance for network
+# jitter. The two pull in opposite directions.
 MAX_SEGMENTS = "8"
 
-# How many segments to advertise in the playlist. AVPro buffers roughly this
-# many before starting, so this is the dominant latency term.
-PLAYLIST_SIZE = "4"
+# Ceiling on how many seconds the playlist may span, regardless of segment
+# count. Guards latency when the encoder emits segments longer than
+# SEGMENT_DURATION, which happens when its keyframe interval does not match.
+MAX_WINDOW_SECONDS = "6"
 
-# Hard ceiling on how many seconds the playlist may span. Protects startup
-# latency when the encoder produces segments longer than SEGMENT_DURATION
-# (usually a keyframe interval that does not match hls_time).
-MAX_WINDOW_SECONDS = "8"
-
-# Edge cache lifetime for the offline playlist, in seconds.
-#
-# Ingest purges this cache entry when a broadcast starts, but Cloudflare's
-# cache is per-colo and the purge only runs where the ingest request landed, so
-# viewers in other regions still wait out the TTL. Keep it short: this is the
-# worst-case delay before a viewer sees the stream has begun.
+# Edge cache lifetime for the offline playlist. Ingest purges the entry when a
+# broadcast starts, but Cloudflare's cache is per-colo and the purge only runs
+# where the ingest request landed — so this is the worst case for viewers in
+# other regions before they see the stream has begun.
 OFFLINE_CACHE_TTL = "3"
 
-# Media type for segments. "octet" serves application/octet-stream instead of
-# video/mp2t; several reference streams that play correctly in AVPro use it,
-# and video/mp2t appears to route some players into a demuxer path that fails.
-SEGMENT_CONTENT_TYPE = "octet"
-
-# Terminate every playlist with ENDLIST, advertising the whole buffer.
-# AVPro in VRChat renders a normal live playlist as black video but plays the
-# same segments when the playlist claims to be finished. Playback then stops
-# at the end of the buffer, and latency equals the buffer length, so this is
-# a fallback rather than the default.
-PSEUDO_VOD = "0"
-
-# Diagnostic: apply the two pseudo-VOD tags independently, to find which one
-# a player actually requires.
-FORCE_VOD_TYPE = "0"
-FORCE_ENDLIST = "0"
-
-# Edge cache lifetime for immutable segments, in seconds.
+# Edge cache lifetime for segments. They are immutable, so this only bounds
+# how long a segment lingers after falling out of the playlist.
 SEGMENT_CACHE_TTL = "30"
+
+# Terminate every playlist with ENDLIST, presenting the live window as a
+# finished clip.
+#
+# For players that cannot follow a live playlist. Notably VRChat under Proton:
+# its Media Foundation translation handles video-on-demand but not the
+# continuous re-reading a live playlist needs, so a normal live stream renders
+# as black video there while the same segments play with ENDLIST present.
+#
+# The cost is real: playback stops at the end of the buffer and does not
+# resume — a player that has seen ENDLIST stops requesting anything at all,
+# so the server cannot hand it more. Leave off unless you need it.
+PSEUDO_VOD = "0"
