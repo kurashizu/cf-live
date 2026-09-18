@@ -1,0 +1,15 @@
+{
+  "name": "cf-live",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Low-latency HLS live relay on Cloudflare Workers + Durable Objects. OBS ingest -> global VRChat playback.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail --format pretty",
+    "secret:key": "wrangler secret put INGEST_KEY"
+  },
+  "devDependencies": {
+    "wrangler": "^4.134.0"
+  }
+}

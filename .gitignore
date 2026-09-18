@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+
+# Contains INGEST_KEY for local dev — never commit.
+.dev.vars
+
+*.log
+tmp/
+tmp-*

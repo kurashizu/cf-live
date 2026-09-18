@@ -1,0 +1,30 @@
+name = "cf-live"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+# Durable Object holds the in-memory segment ring buffer for each stream.
+[[durable_objects.bindings]]
+name = "LIVE_ROOM"
+class_name = "LiveRoom"
+
+# Free-plan Durable Objects must be SQLite-backed, so the class has to be
+# declared with new_sqlite_classes rather than new_classes.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LiveRoom"]
+
+[vars]
+# Segment duration in seconds. Must match OBS's hls_time.
+# Lower = less latency, more requests. 1 is the practical floor.
+SEGMENT_DURATION = "1"
+
+# How many segments the DO keeps in memory. Must exceed PLAYLIST_SIZE so a
+# segment referenced by the playlist is never already evicted.
+MAX_SEGMENTS = "10"
+
+# How many segments to advertise in the playlist. AVPro buffers roughly this
+# many before starting, so this is the dominant latency term.
+PLAYLIST_SIZE = "6"
+
+# Edge cache lifetime for immutable segments, in seconds.
+SEGMENT_CACHE_TTL = "30"
