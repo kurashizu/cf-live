@@ -71,6 +71,12 @@ first_seg() {
   curl -fsS "$BASE/live/$1/index.m3u8" 2>/dev/null \
     | grep -v '^#' | head -1 | tr -d '\r'
 }
+# The newest entry that is a stream-relative segment, skipping slate entries
+# spliced into the same timeline.
+first_live_seg() {
+  curl -fsS "$BASE/live/$1/index.m3u8" 2>/dev/null \
+    | grep -v '^#' | grep -v '^/' | tail -1 | tr -d '\r'
+}
 wait_live() {
   for _ in $(seq 1 45); do
     [ "$(is_live "$1")" = "true" ] && return 0
@@ -104,10 +110,11 @@ done
 
 # ─────────────────────────────────────────────────────────────────────
 sec "2. Offline slate playlist rolls while cached-adjacent"
-# The offline playlist advances its sequence with wall time. If it were
-# cached, a viewer sitting on the offline screen would never see a stream
-# start. Two reads a few seconds apart must differ.
-a=$(seq_of neverused); sleep 4; b=$(seq_of neverused)
+# The slate timeline advances with wall time. If it were cached, a viewer
+# sitting on the offline screen would never see a stream start. Two reads
+# must differ — allow more than one slate duration between them, since the
+# sequence only moves when an entry rolls out of the window.
+a=$(seq_of neverused); sleep 6; b=$(seq_of neverused)
 if [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]; then
   ok "offline sequence advanced ($a → $b)"
 elif [ "$a" = "$b" ]; then
@@ -125,11 +132,14 @@ if ! wait_live "$STREAM"; then
 fi
 ok "stream is live"
 
-seg=$(first_seg "$STREAM")
+seg=$(first_live_seg "$STREAM")
 if [ -z "$seg" ]; then
-  bad "no segment in playlist"
+  bad "no live segment in playlist"
 else
-  url="$BASE/live/$STREAM/$seg"
+  case "$seg" in
+    /*) url="$BASE$seg" ;;
+    *)  url="$BASE/live/$STREAM/$seg" ;;
+  esac
   s1=$(cfstatus "$url"); s2=$(cfstatus "$url"); s3=$(cfstatus "$url")
   note "$seg: $s1 → $s2 → $s3"
   if [ "$s2" = "hit" ] || [ "$s3" = "hit" ]; then

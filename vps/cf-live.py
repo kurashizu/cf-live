@@ -237,6 +237,18 @@ class Handler(BaseHTTPRequestHandler):
                 st = {"seq": 0, "window": [], "live": False,
                       "last_raw": "", "next_slate": 0.0}
                 SEQ_STATE[stream] = st
+                # Start with a full window rather than one entry that grows
+                # over the next few seconds. A player handed a single 2s
+                # fragment has nothing buffered ahead and stalls on the first
+                # jitter — the same failure the repeated-URI bug produced,
+                # just arriving by a different route. These are backdated so
+                # the next entry is due immediately, keeping the timeline on
+                # real time.
+                uri = f"/live/_offline.{CONFIG['slate_version']}"
+                for i in range(max(CONFIG["window"], 1)):
+                    st["window"].append(
+                        (f"{uri}.{i % SLATE_POSITIONS}.ts", dur, False))
+                st["next_slate"] = now
 
             fresh = self.live_segments(stream)
             if fresh:
