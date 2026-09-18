@@ -57,7 +57,7 @@ export default {
           '#EXT-X-PLAYLIST-TYPE:VOD',
           `#EXT-X-TARGETDURATION:${Math.ceil(SLATE_DURATION)}`,
           '#EXT-X-MEDIA-SEQUENCE:0',
-          `#EXTINF:${SLATE_DURATION.toFixed(6)},`,
+          `#EXTINF:${SLATE_DURATION.toFixed(3)}, no desc`,
           `live/_offline.${SLATE_VERSION}.0.ts`,
           '#EXT-X-ENDLIST',
           '',
@@ -397,7 +397,6 @@ export class LiveRoom {
     this.startedAt = 0;
     this.totalSegments = 0;
     this.pendingDiscontinuity = false;
-    this.sequenceBase = 0;
     /** fMP4 initialisation segment, when the encoder sends one. */
     this.initSegment = null;
 
@@ -424,7 +423,9 @@ export class LiveRoom {
       this.startedAt = meta.startedAt ?? 0;
       // Every segment from before the eviction is gone from memory, so the
       // next ingest necessarily starts a new, discontinuous timeline.
-      this.sequenceBase = meta.sequenceBase ?? 0;
+      // Note: a sequenceBase was persisted by an earlier version. It is
+      // deliberately not restored — reviving it would reintroduce the huge
+      // media sequence numbers it used to produce.
       this.pendingDiscontinuity = this.lastIngestAt > 0;
     });
   }
@@ -477,13 +478,6 @@ export class LiveRoom {
     // continues past whatever the offline playlist had reached rather than
     // restarting at zero. The margin covers the window the offline playlist
     // was advertising when the switch happened.
-    // Deliberately NOT continuing from the offline sequence. Doing so kept the
-    // numbering monotonic across the offline->live switch, but it also meant
-    // a live playlist opened at a sequence in the hundreds of thousands, and
-    // AVPro renders such a stream as black video. Reference streams that play
-    // correctly either omit the tag or start near zero, so live numbering
-    // starts from the encoder's own counter.
-    if (!this.sequenceBase) this.sequenceBase = 0;
     this.lastIngestAt = now;
 
     if (file.endsWith('.m3u8')) {
@@ -547,7 +541,6 @@ export class LiveRoom {
       discontinuitySequence: this.discontinuitySequence,
       totalSegments: this.totalSegments,
       startedAt: this.startedAt,
-      sequenceBase: this.sequenceBase,
     });
 
     return text('ok');
@@ -609,7 +602,7 @@ export class LiveRoom {
         `#EXT-X-MEDIA-SEQUENCE:${seq}`,
       ];
       for (let i = 0; i < count; i++) {
-        lines.push(`#EXTINF:${SLATE_DURATION.toFixed(6)},`);
+        lines.push(`#EXTINF:${SLATE_DURATION.toFixed(3)}, no desc`);
         // Distinct URL per slot: players dedupe by URI, and repeating one
         // would be read as the same segment already played rather than the
         // next one in the timeline.
@@ -665,8 +658,11 @@ export class LiveRoom {
     //
     // Offset the encoder's counter past the offline numbering, pinned at the
     // moment ingest began so it stays stable for the rest of the broadcast.
-    const localSeq = segmentIndex(window[0]) ?? (this.mediaSequence + startIndex);
-    const seq = this.sequenceBase + localSeq;
+    // Straight from the encoder's own seg%05d counter. Continuing from the
+    // offline playlist's clock-derived numbering was tried and reverted: it
+    // opened live playlists at sequences in the hundreds of thousands, which
+    // AVPro renders as black video.
+    const seq = segmentIndex(window[0]) ?? (this.mediaSequence + startIndex);
 
     // Deliberately no EXT-X-START. It is the obvious way to pull the entry
     // point toward the live edge, but a stream carrying it would not play in
@@ -895,7 +891,11 @@ function windowDuration(files, durations, fallback) {
  * watching.
  */
 function offlineSequence() {
-  return Math.floor(Date.now() / 1000 / SLATE_DURATION) % 1_000_000;
+  // Wrapped small on purpose. It still has to advance once per slate length
+  // so the playlist reads as live, but AVPro renders a stream whose media
+  // sequence is in the hundreds of thousands as black video, so the modulus
+  // is kept to four digits.
+  return Math.floor(Date.now() / 1000 / SLATE_DURATION) % 10_000;
 }
 
 /** Extract ffmpeg's numeric counter from a segment filename, e.g. seg00042.ts -> 42. */

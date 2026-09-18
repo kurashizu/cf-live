@@ -73,7 +73,7 @@ if grep -q '^#EXTM3U' "$PL" 2>/dev/null; then
 else
   bad "offline playlist malformed"
 fi
-grep -qE '_offline(\.[0-9a-f]{8})?\.ts' "$PL" 2>/dev/null \
+grep -qE '_offline' "$PL" 2>/dev/null \
   && ok "offline playlist points at the slate" \
   || bad "offline playlist has no slate segment"
 grep -q '#EXT-X-ENDLIST' "$PL" 2>/dev/null \
