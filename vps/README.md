@@ -76,6 +76,23 @@ ingress:
 
 nginx listens on `127.0.0.1:8080` only, so the box is not directly exposed.
 
+## Measured performance
+
+Benchmarked against the deployment, 854x480 at 1200 kbps:
+
+| | |
+|---|---|
+| Throughput ceiling | 39.4 Mbps — the uplink, reached at 20 concurrent pulls |
+| CPU at that load | **0.1%** |
+| Memory | 24 MB |
+| Segment size | 174 KB |
+| Bandwidth per viewer | 1.43 Mbps |
+
+The relay is not the constraint; bandwidth is. Capping the uplink at 20 Mbps
+gives roughly **14 viewers** without edge caching. Lowering the bitrate trades
+quality for headroom — 800 kbps at 640x360 fits about 24 — but the cache rule
+below is worth an order of magnitude more, for free.
+
 ## Cache rules — do this, or bandwidth is the limit
 
 Cloudflare does not cache through a tunnel by default, and without caching
@@ -90,8 +107,18 @@ In the dashboard, under **Caching → Cache Rules**, add:
 | When | `URI Path` contains `/live/` and `URI Path` ends with `.ts` |
 | Then | Eligible for cache, Edge TTL: respect origin |
 
+Cloudflare will not do this on its own: `.ts` is not among the extensions it
+treats as static, so segments come back `cf-cache-status: DYNAMIC` even though
+they are served `public, max-age=3600, immutable`. The headers are already
+correct — only the rule is missing.
+
 Verify with `curl -sSI https://<host>/live/main/seg00001.ts | grep cf-cache-status`
 — the second request for the same segment should report `HIT`.
+
+A tunnel alone does not give you this. It routes viewers to a nearby
+Cloudflare colo and carries the origin leg over Cloudflare's backbone, which
+helps latency and stability, but every request still reaches the VPS. The
+tunnel optimises the path; the cache rule optimises bandwidth.
 
 ## OBS
 

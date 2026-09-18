@@ -167,12 +167,16 @@ class Handler(BaseHTTPRequestHandler):
     def serve_media_playlist(self, stream: str):
         live = stream_dir(stream) / "live.m3u8"
         if live.is_file():
-            # ffmpeg writes this, already in the right shape. Never cache it:
-            # a player reusing a stale copy sees the stream frozen. Plain
-            # no-store, not no-cache + must-revalidate — Cloudflare strips
-            # that combination, leaving no directive at all, at which point a
-            # client caches anyway.
-            self.send_file(live, M3U8, "no-store")
+            # Never cache a live playlist: a player reusing a stale copy sees
+            # the stream frozen. Plain no-store, not no-cache +
+            # must-revalidate — Cloudflare strips that combination, leaving no
+            # directive at all, at which point a client caches anyway.
+            try:
+                body = live.read_bytes()
+            except OSError:
+                self.send_text("not found\n", 404)
+                return
+            self.send_body(self.trim_window(body), M3U8, "no-store")
             return
         # Nothing being broadcast. Serve a rolling slate playlist rather than
         # an empty one or a 404: an empty playlist shows the viewer nothing,
@@ -180,6 +184,61 @@ class Handler(BaseHTTPRequestHandler):
         # looks finished so the player stops polling and never notices the
         # broadcast starting.
         self.send_body(self.offline_playlist().encode(), M3U8, "no-store")
+
+    def trim_window(self, body: bytes) -> bytes:
+        """Shorten the playlist to the newest N segments.
+
+        A player starts at the oldest advertised entry, so the window length
+        is the dominant latency term. ffmpeg decides it via hls_list_size, but
+        that lives in the broadcaster's OBS config — trimming here puts
+        latency under server control instead, so it can be tuned without
+        touching the encoder.
+
+        Set --window 0 to pass ffmpeg's playlist through untouched.
+        """
+        keep = CONFIG["window"]
+        if keep <= 0:
+            return body
+
+        lines = body.decode("utf-8", "replace").splitlines()
+        header, entries, seq = [], [], 0
+        pending = None
+        for line in lines:
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    seq = int(line.split(":", 1)[1])
+                except ValueError:
+                    pass
+                header.append(line)
+            elif line.startswith("#EXTINF:"):
+                pending = line
+            elif line and not line.startswith("#"):
+                entries.append((pending, line))
+                pending = None
+            elif line.startswith("#EXT-X-ENDLIST"):
+                # Leave a finished playlist alone; trimming it would hide the
+                # end of the stream.
+                return body
+            else:
+                header.append(line)
+
+        if len(entries) <= keep:
+            return body
+
+        dropped = len(entries) - keep
+        out = []
+        for line in header:
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                # Must advance in step with what was dropped, or a player
+                # computes the wrong live edge.
+                out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq + dropped}")
+            else:
+                out.append(line)
+        for inf, uri in entries[-keep:]:
+            if inf:
+                out.append(inf)
+            out.append(uri)
+        return ("\n".join(out) + "\n").encode()
 
     def offline_playlist(self) -> str:
         import time
@@ -369,7 +428,14 @@ def main():
                     help="directory holding index.html")
     ap.add_argument("--key", default=os.environ.get("INGEST_KEY", ""),
                     help="ingest key; also read from INGEST_KEY")
-    ap.add_argument("--segment-ttl", type=int, default=30)
+    ap.add_argument("--segment-ttl", type=int, default=3600,
+                    help="edge cache lifetime for segments; they are immutable, "
+                         "so this only bounds how long a cached copy survives "
+                         "after falling out of the playlist")
+    ap.add_argument("--window", type=int, default=3,
+                    help="segments to advertise; 0 passes ffmpeg's playlist "
+                         "through. A player starts at the oldest entry, so "
+                         "this is the dominant latency term")
     ap.add_argument("--slate-duration", type=float, default=2.0)
     ap.add_argument("--slate-window", type=int, default=3)
     ap.add_argument("--max-body", type=int, default=32 * 1024 * 1024,
