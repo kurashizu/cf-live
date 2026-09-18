@@ -17,8 +17,8 @@ with the playlist format and cache headers established during the Workers
 build. systemd keeps it alive and recreates the tmpfs tree on boot.
 
 The same service without the Workers free-tier request limit. Needs only
-**nginx** (with the dav module) and **cloudflared** — no RTMP module, no
-transcoder, no media server.
+**python3** (already on the box) and **cloudflared** — no nginx, no RTMP
+module, no transcoder, no media server.
 
 A 1-core / 1 GB box is ample: this is HTTP file serving, not transcoding.
 Bandwidth is the real constraint, and Cloudflare's cache absorbs most of it.
@@ -42,6 +42,11 @@ What carries over is what was hard to get right:
   no directive at all, at which point a browser caches anyway.
 - **The offline slate** — animated, correct codecs, seamless loop, served as a
   rolling playlist so players keep polling and notice the broadcast starting.
+  Its URL carries a fingerprint of its own bytes
+  (`/live/_offline.<sha256[:8]>.ts`), computed at startup. Only the matching
+  fingerprint gets the year-long immutable TTL; the bare path and any stale
+  fingerprint get 60s. Without this a regenerated slate stays pinned in caches
+  for up to a year — which happened, and was not obvious from the server side.
 - **Reserved path handling** so a stream name cannot shadow an endpoint.
 
 ## Install
@@ -102,10 +107,21 @@ it.
 
 In the dashboard, under **Caching → Cache Rules**, add:
 
-| | |
-|---|---|
-| When | `URI Path` contains `/live/` and `URI Path` ends with `.ts` |
-| Then | Eligible for cache, Edge TTL: respect origin |
+Custom filter expression:
+
+```
+(http.host eq "live.krsz.in" and starts_with(http.request.uri.path, "/live/")
+ and (ends_with(http.request.uri.path, ".ts")
+      or ends_with(http.request.uri.path, ".m4s")))
+```
+
+Then: **Eligible for cache**, Edge TTL **Respect origin**, Browser TTL
+**Respect origin**.
+
+**The rule must not match `.m3u8`.** Caching a live media playlist freezes the
+stream: the player re-reads byte-identical bytes, concludes there is nothing
+new, and stops fetching fragments. Match segment extensions only. `.m4s` is
+included so fMP4 segments work if the muxer is ever switched.
 
 Cloudflare will not do this on its own: `.ts` is not among the extensions it
 treats as static, so segments come back `cf-cache-status: DYNAMIC` even though
