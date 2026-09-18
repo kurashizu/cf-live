@@ -662,6 +662,9 @@ async function startStatus(name) {
   // ~35k requests/day doing nothing, enough for three tabs to exhaust the
   // free tier without anyone watching.
   let idleStreak = 0;
+  // null until the first status reply, so the initial load is not treated as a
+  // transition and does not trigger an immediate second load.
+  let wasLive = null;
   const tick = async () => {
     if (currentStream !== name) return;
     if (document.hidden) {
@@ -689,6 +692,19 @@ async function startStatus(name) {
       }
       document.getElementById('s-lat').textContent = lat;
       idleStreak = j.live ? 0 : idleStreak + 1;
+
+      // Reload across an offline/live transition. The offline playlist starts
+      // at MEDIA-SEQUENCE 0 while a live one resumes at whatever the encoder
+      // has reached, and there is no EXT-X-DISCONTINUITY bridging them, so
+      // hls.js treats the jump as a playlist reset and stays on the slate's
+      // timeline instead of following the stream. Rebuilding is the only
+      // reliable way across that seam.
+      if (wasLive !== null && wasLive !== j.live) {
+        wasLive = j.live;
+        load();
+        return;
+      }
+      wasLive = j.live;
     } catch {
       document.getElementById('led').className = 'led';
       document.getElementById('livetext').textContent = 'status unavailable';

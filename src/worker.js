@@ -16,7 +16,7 @@
  */
 
 import { landingPage } from './page.js';
-import { slateBytes, SLATE_DURATION } from './slate.js';
+import { slateBytes, SLATE_DURATION, SLATE_VERSION } from './slate.js';
 
 /**
  * Paths that can never be a stream name, because the short alias route
@@ -83,16 +83,23 @@ export default {
       // The offline slate. Served straight from the Worker with a long cache
       // lifetime — it never changes, so it must never reach a Durable Object.
       // This is what makes an idle viewer free after the first request.
-      if (path === '/live/_offline.ts') {
+      const slate = path.match(/^\/live\/_offline(?:\.([0-9a-f]{8}))?\.ts$/);
+      if (slate) {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
         const bytes = slateBytes();
+        // Only the versioned URL may be cached long-term. An unversioned
+        // request is either an old client or a stale playlist, and caching
+        // that for a year is what pinned viewers to an outdated slate.
+        const versioned = slate[1] === SLATE_VERSION;
         return new Response(request.method === 'HEAD' ? null : bytes, {
           headers: {
             'Content-Type': TS,
             'Content-Length': String(bytes.byteLength),
-            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Cache-Control': versioned
+              ? 'public, max-age=31536000, immutable'
+              : 'public, max-age=60',
             'Access-Control-Allow-Origin': '*',
           },
         });
@@ -445,7 +452,7 @@ export class LiveRoom {
         `#EXT-X-TARGETDURATION:${Math.ceil(SLATE_DURATION)}`,
         '#EXT-X-MEDIA-SEQUENCE:0',
         `#EXTINF:${SLATE_DURATION.toFixed(6)},`,
-        '/live/_offline.ts',
+        `/live/_offline.${SLATE_VERSION}.ts`,
         '',
       ].join('\n');
       return new Response(body, {

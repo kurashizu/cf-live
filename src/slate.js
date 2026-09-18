@@ -506,6 +506,17 @@ const SLATE_B64 =
 
 export const SLATE_DURATION = 2.0;
 
+/**
+ * Content fingerprint, embedded in the slate's URL.
+ *
+ * The segment is served immutable so browsers and the edge cache it
+ * aggressively -- but it does change whenever the slate is regenerated, and a
+ * fixed URL meant clients kept a stale copy indefinitely. Versioning the path
+ * makes a new slate a new URL, so updates take effect immediately while the
+ * long cache lifetime is still safe.
+ */
+export const SLATE_VERSION = '134bc40c';
+
 let cached = null;
 
 /** Decode once per isolate; the bytes are immutable. */

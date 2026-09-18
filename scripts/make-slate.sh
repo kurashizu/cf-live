@@ -27,9 +27,10 @@ ffmpeg -hide_banner -loglevel error -y \
   -muxdelay 0 -muxpreload 0 -f mpegts "$TMP/offline.ts"
 
 python3 - "$TMP/offline.ts" <<'PY'
-import base64, io, sys
+import base64, io, sys, hashlib
 ts = open(sys.argv[1], 'rb').read()
 b64 = base64.b64encode(ts).decode()
+ver = hashlib.sha256(ts).hexdigest()[:8]
 lines = [b64[i:i+96] for i in range(0, len(b64), 96)]
 body = "'" + ("' +\n  '".join(lines)) + "'"
 out = f'''/**
@@ -54,6 +55,17 @@ const SLATE_B64 =
   {body};
 
 export const SLATE_DURATION = 2.0;
+
+/**
+ * Content fingerprint, embedded in the slate's URL.
+ *
+ * The segment is served immutable so browsers and the edge cache it
+ * aggressively -- but it does change whenever the slate is regenerated, and a
+ * fixed URL meant clients kept a stale copy indefinitely. Versioning the path
+ * makes a new slate a new URL, so updates take effect immediately while the
+ * long cache lifetime is still safe.
+ */
+export const SLATE_VERSION = '{ver}';
 
 let cached = null;
 

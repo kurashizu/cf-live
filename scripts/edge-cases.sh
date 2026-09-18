@@ -64,7 +64,7 @@ if grep -q '^#EXTM3U' "$PL" 2>/dev/null; then
 else
   bad "offline playlist malformed"
 fi
-grep -q '_offline.ts' "$PL" 2>/dev/null \
+grep -qE '_offline(\.[0-9a-f]{8})?\.ts' "$PL" 2>/dev/null \
   && ok "offline playlist points at the slate" \
   || bad "offline playlist has no slate segment"
 grep -q '#EXT-X-ENDLIST' "$PL" 2>/dev/null \
@@ -80,8 +80,11 @@ sec "2. Offline slate segment"
   && ok "slate segment served" || bad "slate segment missing"
 hdr "$BASE/live/_offline.ts" | grep -qi 'content-type: video/mp2t' \
   && ok "slate has video/mp2t type" || bad "slate has wrong content type"
-hdr "$BASE/live/_offline.ts" | grep -qi 'immutable' \
-  && ok "slate is immutable" || bad "slate not immutable"
+SLATE_URL=$(curl -fsS "$BASE/neverused" 2>/dev/null \
+             | grep -oE '/live/_offline(\.[0-9a-f]{8})?\.ts' | head -1)
+hdr "$BASE${SLATE_URL:-/live/_offline.ts}" | grep -qi 'immutable' \
+  && ok "the slate the playlist points at is immutable" \
+  || bad "the slate the playlist points at is not immutable"
 curl -fsS "$BASE/live/_offline.ts" -o "$TMP/slate.ts" 2>/dev/null
 if [ -s "$TMP/slate.ts" ]; then
   # First byte must be the TS sync byte or no player will touch it.
@@ -104,6 +107,26 @@ fi
 # A stream named _offline must not shadow the slate route.
 [ "$(code "$BASE/live/_offline.ts")" = "200" ] \
   && ok "slate route wins over stream routing" || bad "slate route shadowed"
+
+# The slate is served immutable for a year, so its URL must change when the
+# content does — otherwise clients keep a stale copy indefinitely, which is
+# exactly what pinned viewers to a pre-watermark slate in production.
+VER=$(curl -fsS "$BASE/neverused" 2>/dev/null | grep -oE '_offline\.[0-9a-f]{8}\.ts')
+if [ -n "$VER" ]; then
+  ok "offline playlist references a versioned slate ($VER)"
+  [ "$(code "$BASE/live/$VER")" = "200" ] \
+    && ok "versioned slate URL resolves" || bad "versioned slate URL 404s"
+  hdr "$BASE/live/$VER" | grep -qi 'immutable' \
+    && ok "versioned slate is immutable" || bad "versioned slate not immutable"
+  # The unversioned path must NOT be cached long-term.
+  if hdr "$BASE/live/_offline.ts" | grep -qi 'immutable'; then
+    bad "unversioned slate is immutable — stale copies cannot be displaced"
+  else
+    ok "unversioned slate has a short cache lifetime"
+  fi
+else
+  bad "offline playlist does not reference a versioned slate"
+fi
 
 sec "3. Reserved paths are not treated as stream names"
 for p in healthz status live ingest favicon.ico; do

@@ -258,6 +258,10 @@ slate rather than an empty playlist. It carries a `KRSZ LIVE` watermark, a
 alive and simply not broadcasting yet.
 
 Regenerate it with `scripts/make-slate.sh` after editing `scripts/slate.py`.
+The generated URL carries a content fingerprint (`_offline.<hash>.ts`), so a
+regenerated slate is a new URL and reaches viewers immediately despite being
+served `immutable` for a year. The unversioned path still works for old
+clients but is deliberately short-lived.
 The animation is a ping-pong sweep driven by a cosine, so velocity is zero at
 both ends of the 2s segment and the loop point is continuous in both position
 and motion — no visible jerk each time a player repeats it. Frames are drawn by
