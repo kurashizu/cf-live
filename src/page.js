@@ -657,8 +657,18 @@ function fmtBytes(n) {
 
 async function startStatus(name) {
   if (statusTimer) clearTimeout(statusTimer);
+  // Back off while offline and pause entirely when the tab is hidden. A fixed
+  // 2s poll was the single largest idle cost: one page left open consumed
+  // ~35k requests/day doing nothing, enough for three tabs to exhaust the
+  // free tier without anyone watching.
+  let idleStreak = 0;
   const tick = async () => {
     if (currentStream !== name) return;
+    if (document.hidden) {
+      // Nobody is looking; check back only when the tab is shown again.
+      statusTimer = setTimeout(tick, 5000);
+      return;
+    }
     try {
       const r = await fetch('/status/' + encodeURIComponent(name), { cache: 'no-store' });
       const j = await r.json();
@@ -678,12 +688,29 @@ async function startStatus(name) {
         lat = Math.max(0, v.seekable.end(v.seekable.length - 1) - v.currentTime).toFixed(1) + 's';
       }
       document.getElementById('s-lat').textContent = lat;
+      idleStreak = j.live ? 0 : idleStreak + 1;
     } catch {
       document.getElementById('led').className = 'led';
       document.getElementById('livetext').textContent = 'status unavailable';
+      idleStreak++;
     }
-    statusTimer = setTimeout(tick, 2000);
+    // Live: stay responsive. Offline: ease off towards 30s.
+    const delay = idleStreak === 0
+      ? 2000
+      : Math.min(30000, 2000 * Math.pow(2, Math.min(idleStreak, 4)));
+    statusTimer = setTimeout(tick, delay);
   };
+  // Resume promptly when the tab comes back, rather than waiting out a backoff.
+  if (!window.__visHooked) {
+    window.__visHooked = true;
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && statusTimer) {
+        clearTimeout(statusTimer);
+        idleStreak = 0;
+        tick();
+      }
+    });
+  }
   tick();
 }
 

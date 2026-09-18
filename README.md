@@ -240,3 +240,29 @@ ffprobe out.ts
 ```
 
 `scripts/smoke.sh` runs that whole loop and checks the results.
+`scripts/edge-cases.sh` covers the boundary conditions — offline viewers,
+encoder restarts, oversized segments, concurrent streams, malformed ingest,
+and the caching the free tier depends on. Both accept a base URL, so they can
+run against a deployment as well as locally:
+
+```sh
+scripts/smoke.sh      https://<your-worker> "$INGEST_KEY"
+scripts/edge-cases.sh https://<your-worker> "$INGEST_KEY"
+```
+
+## Offline behaviour
+
+A stream with no live content serves a playable "OFFLINE / WAITING FOR STREAM"
+slate rather than an empty playlist. Viewers see why there is no picture, and
+because the slate is identical on every request it can be cached at the edge —
+which is what keeps idle viewers from draining the request quota.
+
+An empty playlist cost ~0.67 req/s per idle viewer indefinitely: three tabs
+left open would exhaust a day's free tier showing nothing. The slate playlist
+is cached for `OFFLINE_CACHE_TTL` seconds and the status poll backs off from 2s
+toward 30s while offline (pausing entirely on a hidden tab), which measured at
+~90% edge-hit rate in production.
+
+The trade-off is that a viewer may keep seeing the slate for up to
+`OFFLINE_CACHE_TTL` seconds after a broadcast actually starts. Lower it for a
+faster start, raise it to spend less quota.

@@ -16,6 +16,7 @@
  */
 
 import { landingPage } from './page.js';
+import { slateBytes, SLATE_DURATION } from './slate.js';
 
 /**
  * Paths that can never be a stream name, because the short alias route
@@ -65,7 +66,25 @@ export default {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        return roomFetch(env, stream, request, '/playlist');
+        return servePlaylist(env, stream, request, ctx);
+      }
+
+      // The offline slate. Served straight from the Worker with a long cache
+      // lifetime — it never changes, so it must never reach a Durable Object.
+      // This is what makes an idle viewer free after the first request.
+      if (path === '/live/_offline.ts') {
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return text('method not allowed', 405);
+        }
+        const bytes = slateBytes();
+        return new Response(request.method === 'HEAD' ? null : bytes, {
+          headers: {
+            'Content-Type': TS,
+            'Content-Length': String(bytes.byteLength),
+            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
       }
 
       // /live/<stream>/<file>.ts
@@ -97,7 +116,7 @@ export default {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        return roomFetch(env, alias[1], request, '/playlist');
+        return servePlaylist(env, alias[1], request, ctx);
       }
 
       return text('not found', 404);
@@ -142,6 +161,38 @@ async function serveSegment(env, stream, file, request, ctx) {
   return new Response(bytes, { headers });
 }
 
+/**
+ * Serve a playlist, caching it at the edge only when the DO says it is safe.
+ *
+ * A live playlist must never be cached: hls.js treats a byte-identical
+ * manifest as "nothing new" and stops loading fragments, which stalls
+ * playback. The offline slate playlist is the opposite — it is identical on
+ * every request, and caching it is what stops an idle viewer from reaching the
+ * Worker at all. Cloudflare will not cache these paths on its own (no static
+ * extension), so it has to go through the Cache API explicitly.
+ */
+async function servePlaylist(env, stream, request, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(new URL(request.url).toString(), { method: 'GET' });
+
+  const hit = await cache.match(cacheKey);
+  if (hit) return hit;
+
+  const res = await roomFetch(env, stream, request, '/playlist');
+  // The DO marks a cacheable (offline) playlist with an explicit max-age.
+  const cc = res.headers.get('cache-control') || '';
+  if (res.status === 200 && /max-age=[1-9]/.test(cc) && !/no-store/.test(cc)) {
+    const body = await res.text();
+    const headers = new Headers(res.headers);
+    const cached = new Response(body, { status: 200, headers });
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(cache.put(cacheKey, cached.clone()));
+    }
+    return cached;
+  }
+  return res;
+}
+
 /** Route a request to the DO that owns this stream. */
 function roomFetch(env, stream, request, innerPath) {
   const id = env.LIVE_ROOM.idFromName(stream);
@@ -175,24 +226,6 @@ export class LiveRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    /**
-     * Restore the small amount of metadata that must outlive eviction.
-     * Segments deliberately stay in memory, but timing/discontinuity state is
-     * only a few bytes and losing it splices a restarted encoder into the
-     * timeline with no discontinuity marker.
-     */
-    this.ready = state.blockConcurrencyWhile(async () => {
-      const meta = await state.storage.get('meta');
-      if (meta) {
-        this.lastIngestAt = meta.lastIngestAt ?? 0;
-        this.discontinuitySequence = meta.discontinuitySequence ?? 0;
-        this.totalSegments = meta.totalSegments ?? 0;
-        this.startedAt = meta.startedAt ?? 0;
-        // Any segment referenced before eviction is gone from memory, so the
-        // next ingest necessarily begins a new, discontinuous timeline.
-        this.pendingDiscontinuity = this.lastIngestAt > 0;
-      }
-    });
 
     /** @type {Map<string, {bytes: Uint8Array, at: number}>} filename -> segment */
     this.segments = new Map();
@@ -226,6 +259,28 @@ export class LiveRoom {
     this.startedAt = 0;
     this.totalSegments = 0;
     this.pendingDiscontinuity = false;
+
+    /**
+     * Restore the metadata that must outlive eviction. Segments deliberately
+     * stay in memory, but timing and discontinuity state is only a few bytes,
+     * and losing it splices a restarted encoder into the timeline with no
+     * discontinuity marker.
+     *
+     * This must come after the defaults above: blockConcurrencyWhile takes an
+     * async callback, so the rest of the constructor runs first and would
+     * otherwise overwrite everything restored here.
+     */
+    this.ready = state.blockConcurrencyWhile(async () => {
+      const meta = await state.storage.get('meta');
+      if (!meta) return;
+      this.lastIngestAt = meta.lastIngestAt ?? 0;
+      this.discontinuitySequence = meta.discontinuitySequence ?? 0;
+      this.totalSegments = meta.totalSegments ?? 0;
+      this.startedAt = meta.startedAt ?? 0;
+      // Every segment from before the eviction is gone from memory, so the
+      // next ingest necessarily starts a new, discontinuous timeline.
+      this.pendingDiscontinuity = this.lastIngestAt > 0;
+    });
   }
 
   async fetch(request) {
@@ -345,19 +400,28 @@ export class LiveRoom {
 
   handlePlaylist(stream) {
     if (this.order.length === 0) {
-      // Nothing ingested yet. A 404 makes AVPro give up permanently, so serve
-      // a valid empty live playlist and let it keep polling.
+      // No live content. Serve a playable "OFFLINE" slate rather than an empty
+      // playlist: an empty one shows viewers nothing and makes every player
+      // poll forever, and a 404 makes AVPro give up permanently.
+      //
+      // The slate is identical on every request, so unlike a live playlist it
+      // can be cached at the edge. That is what stops idle viewers from
+      // draining request quota — previously a single page left open cost
+      // ~0.67 req/s indefinitely.
+      const ttl = intVar(this.env.OFFLINE_CACHE_TTL, 10);
       const body = [
         '#EXTM3U',
         '#EXT-X-VERSION:3',
-        `#EXT-X-TARGETDURATION:${this.targetDuration}`,
+        `#EXT-X-TARGETDURATION:${Math.ceil(SLATE_DURATION)}`,
         '#EXT-X-MEDIA-SEQUENCE:0',
+        `#EXTINF:${SLATE_DURATION.toFixed(6)},`,
+        '/live/_offline.ts',
         '',
       ].join('\n');
       return new Response(body, {
         headers: {
           'Content-Type': M3U8,
-          'Cache-Control': 'no-store',
+          'Cache-Control': `public, max-age=${ttl}`,
           'Access-Control-Allow-Origin': '*',
         },
       });

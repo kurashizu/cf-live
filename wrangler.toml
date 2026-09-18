@@ -31,5 +31,9 @@ PLAYLIST_SIZE = "4"
 # (usually a keyframe interval that does not match hls_time).
 MAX_WINDOW_SECONDS = "8"
 
+# Edge cache lifetime for the offline playlist, in seconds. Raising this makes
+# idle viewers cheaper but delays how quickly they notice a broadcast starting.
+OFFLINE_CACHE_TTL = "10"
+
 # Edge cache lifetime for immutable segments, in seconds.
 SEGMENT_CACHE_TTL = "30"
