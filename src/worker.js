@@ -33,8 +33,9 @@ const RESERVED_PATHS = new Set([
 // route on it into a demuxer path that handles our segments poorly, so this
 // is configurable to allow testing against octet-stream — which is what
 // several reference streams that do play actually serve.
-const TS = 'video/mp2t';
-const TS_ALT = 'application/octet-stream';
+// SRS serves exactly this, casing included; matching it removes one
+// difference from a stack known to play in VRChat.
+const TS = 'video/MP2T';
 const M3U8 = 'application/vnd.apple.mpegurl';
 
 export default {
@@ -233,7 +234,7 @@ async function serveSegment(env, stream, file, request, ctx) {
   const bytes = await res.arrayBuffer();
   const ttl = intVar(env.SEGMENT_CACHE_TTL, 30);
   const headers = {
-    'Content-Type': env.SEGMENT_CONTENT_TYPE === 'octet' ? TS_ALT : TS,
+    'Content-Type': TS,
     'Content-Length': String(bytes.byteLength),
     // Segments never change once written, so this is always safe and means a
     // region only pulls from the single-colo DO once per segment.
@@ -258,9 +259,12 @@ function masterPlaylist(stream) {
   const body = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
-    // avc1.4d401f = H.264 Main 3.1, mp4a.40.2 = AAC-LC: what the OBS
-    // instructions produce. Bandwidth is a hint, not a promise.
-    '#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.4d401f,mp4a.40.2"',
+    // Matches SRS, which advertises only a nominal bandwidth and omits
+    // CODECS and RESOLUTION entirely. Declaring codecs invites a player to
+    // decide up front whether it can decode the stream, and a mismatch
+    // between the declaration and the actual bitstream is a plausible cause
+    // of a black picture with otherwise healthy playback.
+    '#EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1',
     // Relative to wherever the master was fetched from, which is always one
     // level above /live/<stream>/.
     `live/${encodeURIComponent(stream)}/index.m3u8`,
@@ -512,7 +516,16 @@ export class LiveRoom {
     this.totalSegments++;
 
     if (this.pendingDiscontinuity) {
-      this.discontinuityAt = file;
+      // The encoder restarted, and its segment counter restarts with it.
+      // Keeping the previous timeline's segments would interleave two
+      // unrelated numberings in one playlist — seg00039 followed by
+      // seg00000 — which makes the media sequence go backwards and is enough
+      // on its own to leave a player showing black video. Drop them and
+      // start clean from the new timeline.
+      this.segments.clear();
+      this.order.length = 0;
+      this.durations.clear();
+      this.discontinuityAt = null;
       this.pendingDiscontinuity = false;
       this.discontinuitySequence++;
     }
@@ -659,12 +672,13 @@ export class LiveRoom {
     // point toward the live edge, but a stream carrying it would not play in
     // AVPro at all, and the window is only a few seconds long anyway — the
     // short window achieves the same latency without the tag.
+    // Header order follows SRS: VERSION, MEDIA-SEQUENCE, TARGETDURATION.
+    // EXT-X-MAP requires version 7; plain TS segments only need 3.
     const lines = [
       '#EXTM3U',
-      // EXT-X-MAP requires version 7; plain TS segments only need 3.
       `#EXT-X-VERSION:${this.initSegment ? 7 : 3}`,
-      `#EXT-X-TARGETDURATION:${this.targetDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
+      `#EXT-X-TARGETDURATION:${this.targetDuration}`,
     ];
     if (pseudoVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
     if (this.discontinuitySequence > 0) {
@@ -676,10 +690,19 @@ export class LiveRoom {
       lines.push(`#EXT-X-MAP:URI="${this.initSegment.name}"`);
     }
 
-    for (const file of window) {
-      if (file === this.discontinuityAt) lines.push('#EXT-X-DISCONTINUITY');
+    window.forEach((file, i) => {
+      // Only mark a discontinuity between segments, never before the first
+      // one in the window: at that position it tells a player the stream
+      // breaks at the very point it is about to start decoding, and SRS only
+      // emits the tag when an actual codec change occurred.
+      if (file === this.discontinuityAt && i > 0) {
+        lines.push('#EXT-X-DISCONTINUITY');
+      }
       const dur = this.durations.get(file) ?? this.targetDuration;
-      lines.push(`#EXTINF:${dur.toFixed(6)},`);
+      // Three decimals and the ", no desc" title are SRS's exact output.
+      // SRS declined to change the title (ossrs/srs#2343), so every player
+      // that works against SRS has been exercised against this form.
+      lines.push(`#EXTINF:${dur.toFixed(3)}, no desc`);
       // Root-absolute on purpose: this playlist is served from three paths
       // (/live/<s>.m3u8, /<s>.m3u8 and /<s>), and a relative URI would
       // resolve differently under each. An absolute path is correct for all.
@@ -689,7 +712,7 @@ export class LiveRoom {
       // reference stream avoids, and AVPro would not play a playlist using
       // them.
       lines.push(file);
-    }
+    });
     if (pseudoVod) lines.push('#EXT-X-ENDLIST');
     lines.push('');
 

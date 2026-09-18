@@ -53,12 +53,21 @@ wait_segs() {
   return 1
 }
 
+
+# Fetch a stream's media playlist. The short routes now return a master
+# playlist naming one variant, so follow it to the media playlist the way a
+# player would.
+media_playlist() {
+  local stream="$1"
+  curl -fsS "$BASE/live/$stream/index.m3u8" 2>/dev/null
+}
+
 echo "target: $BASE"
 
 # ─────────────────────────────────────────────────────────────────────
 sec "1. Offline stream (never broadcast)"
 PL="$TMP/off.m3u8"
-curl -fsS "$BASE/neverused" -o "$PL" 2>/dev/null
+media_playlist neverused > "$PL" 2>/dev/null
 if grep -q '^#EXTM3U' "$PL" 2>/dev/null; then
   ok "offline playlist is valid HLS"
 else
@@ -80,9 +89,9 @@ sec "2. Offline slate segment"
   && ok "slate segment served" || bad "slate segment missing"
 hdr "$BASE/live/_offline.ts" | grep -qi 'content-type: video/mp2t' \
   && ok "slate has video/mp2t type" || bad "slate has wrong content type"
-SLATE_URL=$(curl -fsS "$BASE/neverused" 2>/dev/null \
-             | grep -oE '/live/_offline(\.[0-9a-f]{8})?\.ts' | head -1)
-hdr "$BASE${SLATE_URL:-/live/_offline.ts}" | grep -qi 'immutable' \
+SLATE_REF=$(media_playlist neverused | grep -oE '[^[:space:]]*_offline[^[:space:]]*\.ts' | head -1)
+SLATE_URL="/live/${SLATE_REF#../}"
+hdr "$BASE${SLATE_URL}" | grep -qi 'immutable' \
   && ok "the slate the playlist points at is immutable" \
   || bad "the slate the playlist points at is not immutable"
 curl -fsS "$BASE/live/_offline.ts" -o "$TMP/slate.ts" 2>/dev/null
@@ -111,7 +120,7 @@ fi
 # The slate is served immutable for a year, so its URL must change when the
 # content does — otherwise clients keep a stale copy indefinitely, which is
 # exactly what pinned viewers to a pre-watermark slate in production.
-VER=$(curl -fsS "$BASE/neverused" 2>/dev/null | grep -oE '_offline\.[0-9a-f]{8}\.ts')
+VER=$(media_playlist neverused | grep -oE '_offline\.[0-9a-f]{8}\.[0-9]+\.ts' | head -1)
 if [ -n "$VER" ]; then
   ok "offline playlist references a versioned slate ($VER)"
   [ "$(code "$BASE/live/$VER")" = "200" ] \
@@ -127,6 +136,17 @@ if [ -n "$VER" ]; then
 else
   bad "offline playlist does not reference a versioned slate"
 fi
+
+sec "2b. Master playlist"
+# Short routes hand back a master naming one variant; SRS does the same, and
+# a bare media playlist is a different code path in the player.
+M="$TMP/master.m3u8"
+curl -fsS "$BASE/neverused" -o "$M" 2>/dev/null
+grep -q '^#EXTM3U' "$M" 2>/dev/null && ok "master is valid HLS" || bad "master malformed"
+grep -q 'EXT-X-STREAM-INF' "$M" 2>/dev/null \
+  && ok "master declares a variant" || bad "master has no EXT-X-STREAM-INF"
+grep -q 'index.m3u8' "$M" 2>/dev/null \
+  && ok "master points at the media playlist" || bad "master does not reference index.m3u8"
 
 sec "3. Reserved paths are not treated as stream names"
 for p in healthz status live ingest favicon.ico; do
@@ -177,12 +197,12 @@ sec "6. Live stream, normal case"
 publish live1 45 2 60
 if wait_segs live1 4; then
   ok "ingest accepted and buffered"
-  curl -fsS "$BASE/live1" -o "$TMP/l1.m3u8"
+  media_playlist live1 > "$TMP/l1.m3u8"
   grep -q '_offline' "$TMP/l1.m3u8" \
     && bad "live stream still advertising the slate" \
     || ok "live playlist replaced the slate"
-  hdr "$BASE/live1" | grep -qi 'cache-control:.*no-store' \
-    && ok "live playlist is no-store (hls.js needs fresh manifests)" \
+  hdr "$BASE/live/live1/index.m3u8" | grep -qi 'cache-control:.*no-cache' \
+    && ok "live playlist must revalidate (players need fresh manifests)" \
     || bad "live playlist is cacheable — playback will stall"
   SEQ=$(grep -oE 'MEDIA-SEQUENCE:[0-9]+' "$TMP/l1.m3u8" | cut -d: -f2)
   FIRST=$(grep -m1 -oE 'seg[0-9]+' "$TMP/l1.m3u8" | grep -oE '[0-9]+' | sed 's/^0*//')
@@ -191,8 +211,8 @@ if wait_segs live1 4; then
     || bad "MEDIA-SEQUENCE $SEQ != first segment ${FIRST:-0}"
   # Every advertised segment must resolve, or playback breaks mid-stream.
   MISS=0
-  for f in $(grep -oE '/live/live1/seg[0-9]+\.ts' "$TMP/l1.m3u8"); do
-    [ "$(code "$BASE$f")" = "200" ] || MISS=$((MISS+1))
+  for f in $(grep -oE '^seg[0-9]+\.ts' "$TMP/l1.m3u8"); do
+    [ "$(code "$BASE/live/live1/$f")" = "200" ] || MISS=$((MISS+1))
   done
   [ "$MISS" = "0" ] && ok "all advertised segments resolve" \
                     || bad "$MISS advertised segments 404"
@@ -212,7 +232,7 @@ sec "7. Oversized segments (keyframe interval misconfigured)"
 # must stay bounded by duration rather than stretching to 4 x 8s.
 publish badgop 40 1 249
 if wait_segs badgop 2; then
-  curl -fsS "$BASE/badgop" -o "$TMP/bg.m3u8"
+  media_playlist badgop > "$TMP/bg.m3u8"
   T=$(grep -oE '#EXTINF:[0-9.]+' "$TMP/bg.m3u8" | cut -d: -f2 \
       | awk '{s+=$1} END {printf "%.0f", s}')
   N=$(grep -c 'seg' "$TMP/bg.m3u8")
@@ -238,10 +258,13 @@ if wait_segs multi2 3; then
   B=$(curl -fsS "$BASE/status/multi2" | grep -o '"totalSegments":[0-9]*' | cut -d: -f2)
   [ -n "$A" ] && [ -n "$B" ] && ok "two streams tracked independently (${A} / ${B} segments)" \
                              || bad "stream isolation unclear"
-  curl -fsS "$BASE/multi2" -o "$TMP/m2.m3u8"
-  grep -q '/live/multi2/' "$TMP/m2.m3u8" \
-    && ok "playlist references its own stream directory" \
-    || bad "playlist references the wrong stream"
+  media_playlist multi2 > "$TMP/m2.m3u8"
+  # Segment URIs are relative now, so correctness is that they resolve under
+  # this stream's directory.
+  F2=$(grep -m1 -oE '^seg[0-9]+\.ts' "$TMP/m2.m3u8")
+  [ -n "$F2" ] && [ "$(code "$BASE/live/multi2/$F2")" = "200" ] \
+    && ok "playlist segments resolve under their own stream" \
+    || bad "playlist segments do not resolve"
   # Both streams contain the same sequence numbers, so a 200 here is expected.
   # Isolation means the bytes differ — each stream has its own Durable Object.
   F=$(grep -m1 -oE 'seg[0-9]+\.ts' "$TMP/m2.m3u8")
@@ -261,9 +284,10 @@ fi
 
 sec "9. Segment caching (free-tier quota depends on it)"
 if wait_segs live1 3; then
-  curl -fsS "$BASE/live1" -o "$TMP/c.m3u8"
-  SEG=$(grep -m1 -oE '/live/live1/seg[0-9]+\.ts' "$TMP/c.m3u8")
+  media_playlist live1 > "$TMP/c.m3u8"
+  SEG=$(grep -m1 -oE '^seg[0-9]+\.ts' "$TMP/c.m3u8")
   if [ -n "$SEG" ]; then
+    SEG="/live/live1/$SEG"
     hdr "$BASE$SEG" | grep -qi 'cache-control:.*immutable' \
       && ok "live segments are immutable" || bad "live segments not immutable"
     curl -sS -o /dev/null "$BASE$SEG"
@@ -285,14 +309,14 @@ sec "9b. Offline playlist is edge-cached (idle viewers must be cheap)"
 # free tier while showing nothing.
 HITS=0; TOTAL=0
 for _ in $(seq 1 5); do
-  S=$(hdr "$BASE/idlecachecheck" | grep -i 'cf-cache-status' | tr -d '\r' | awk '{print $2}')
+  S=$(hdr "$BASE/live/idlecachecheck/index.m3u8" | grep -i 'cf-cache-status' | tr -d '\r' | awk '{print $2}')
   TOTAL=$((TOTAL+1))
   echo "$S" | grep -qi HIT && HITS=$((HITS+1))
   sleep 1
 done
 if [ "$TOTAL" -gt 0 ] && [ "$HITS" -ge 2 ]; then
   ok "offline playlist hits the edge cache ($HITS/$TOTAL)"
-elif hdr "$BASE/idlecachecheck" | grep -qi 'cf-cache-status'; then
+elif hdr "$BASE/live/idlecachecheck/index.m3u8" | grep -qi 'cf-cache-status'; then
   bad "offline playlist never cached ($HITS/$TOTAL hits) — idle viewers drain quota"
 else
   note "no edge cache in this environment (local dev)"
@@ -310,7 +334,7 @@ SEEN_LIVE=-1
 for t in $(seq 0 14); do
   DO_SEGS=$(curl -fsS "$BASE/status/$RS" 2>/dev/null \
             | grep -o '"segmentsBuffered":[0-9]*' | cut -d: -f2)
-  if ! curl -fsS "$BASE/$RS" 2>/dev/null | grep -q '_offline'; then
+  if ! media_playlist "$RS" | grep -q '_offline'; then
     SEEN_LIVE=$t
     break
   fi
@@ -374,7 +398,7 @@ sleep 12
 publish live1 20 2 60
 if wait_segs live1 2; then
   D2=$(curl -fsS "$BASE/status/live1" | grep -o '"discontinuitySequence":[0-9]*' | cut -d: -f2)
-  curl -fsS "$BASE/live1" -o "$TMP/r.m3u8"
+  media_playlist live1 > "$TMP/r.m3u8"
   ok "stream recovered after restart"
   # Without a marker, players splice a discontinuous timeline and can stall or
   # show corrupt frames across the join.
@@ -389,8 +413,8 @@ if wait_segs live1 2; then
   grep -q '^#EXTM3U' "$TMP/r.m3u8" && ok "playlist valid after restart" \
                                    || bad "playlist broken after restart"
   MISS=0
-  for f in $(grep -oE '/live/live1/seg[0-9]+\.ts' "$TMP/r.m3u8"); do
-    [ "$(code "$BASE$f")" = "200" ] || MISS=$((MISS+1))
+  for f in $(grep -oE '^seg[0-9]+\.ts' "$TMP/r.m3u8"); do
+    [ "$(code "$BASE/live/live1/$f")" = "200" ] || MISS=$((MISS+1))
   done
   [ "$MISS" = "0" ] && ok "all segments resolve after restart" \
                     || bad "$MISS segments 404 after restart"
@@ -409,7 +433,7 @@ done
 C=$(code "$BASE/multi2")
 [ "$C" = "200" ] && ok "stopped stream still returns 200 (not 404)" \
                  || bad "stopped stream → $C"
-if curl -fsS "$BASE/multi2" | grep -q '_offline'; then
+if media_playlist multi2 | grep -q '_offline'; then
   ok "stopped stream fell back to the slate"
 else
   note "still serving buffered segments (ring not yet drained) — acceptable"
