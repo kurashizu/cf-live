@@ -204,8 +204,15 @@ export class LiveRoom {
     this.discontinuitySequence = 0;
     /** Target duration in seconds, from config. */
     this.targetDuration = intVar(env.SEGMENT_DURATION, 1);
-    this.maxSegments = Math.max(2, intVar(env.MAX_SEGMENTS, 8));
     this.playlistSize = Math.max(1, intVar(env.PLAYLIST_SIZE, 4));
+    // The ring must hold at least one segment more than the playlist
+    // advertises, or eviction would drop a segment the playlist still points
+    // at and viewers would get a 404 for it. Enforced rather than documented,
+    // since a misconfiguration here breaks playback for everyone.
+    this.maxSegments = Math.max(
+      this.playlistSize + 1,
+      intVar(env.MAX_SEGMENTS, 8),
+    );
     /** Per-segment durations parsed from OBS's own playlist, keyed by file. */
     this.durations = new Map();
 
@@ -365,12 +372,14 @@ export class LiveRoom {
     // oldest segment in the window and then buffer further on top, which is
     // what turns a 6s window into 20-30s of observed latency.
     //
-    // Offset is negative = measured back from the live edge. Holding back
-    // ~2 segments leaves enough buffer to absorb jitter without the player
-    // starting far behind.
+    // Offset is negative = measured back from the live edge. Hold back a
+    // little over one segment: enough that the player starts with a whole
+    // segment in hand, but not scaled to a multiple of the segment duration —
+    // at 4s segments a "two segment" rule would push the entry point 8s back
+    // and dominate the latency budget.
     const startOffset = Math.min(
       windowDuration(window, this.durations, this.targetDuration),
-      this.targetDuration * 2,
+      this.targetDuration + 1,
     );
     const lines = [
       '#EXTM3U',

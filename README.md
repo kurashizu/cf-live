@@ -145,20 +145,42 @@ A wrong key returns `403`. Stream and file names are restricted to
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SEGMENT_DURATION` | `1` | Seconds per segment. Must match OBS's `hls_time`. |
-| `MAX_SEGMENTS` | `10` | Segments held in memory. Must exceed `PLAYLIST_SIZE`. |
-| `PLAYLIST_SIZE` | `6` | Segments advertised in the playlist. |
+| `SEGMENT_DURATION` | `2` | Seconds per segment. Must match OBS's `hls_time`. |
+| `MAX_SEGMENTS` | `6` | Segments held in memory. Raised automatically to `PLAYLIST_SIZE + 1` if set lower. |
+| `PLAYLIST_SIZE` | `4` | Segments advertised in the playlist. |
 | `SEGMENT_CACHE_TTL` | `30` | Edge cache lifetime for immutable segments. |
 
-## Latency
+## Latency and tolerance
 
-End-to-end latency ≈ segment duration × segments the player buffers before
-starting, plus upload and CDN propagation. With 1s segments this lands around
-**4–6 seconds**.
+Two different numbers, set by two different knobs:
 
-That is the floor for this architecture. Going lower requires LL-HLS partial
-segments, which AVPro does not reliably support; sub-second needs WebRTC, which
-the VRChat players cannot consume.
+**Startup latency** — how far behind a viewer begins — is bounded by
+`PLAYLIST_SIZE`, since a player can only start on a segment the playlist
+advertises. At the defaults (2s segments, 4 advertised):
+
+| | |
+|---|---|
+| Encoder fills one segment | 2.0s (unavoidable) |
+| Upload until readable | ~0.5s (measured 0.04–0.85s) |
+| Player honours `EXT-X-START` | **~5.5s total** |
+| Player starts at the oldest advertised segment | **~8.5s total** |
+
+**Worst-case steady-state latency** — how far behind a viewer may drift and
+still keep playing — equals the tolerance window, `MAX_SEGMENTS × segment
+duration`, because that is how much history stays in memory. At the defaults
+that is 12s of tolerance, so ~14.5s worst case.
+
+These conflict directly: a deeper ring absorbs more network jitter without a
+rebuffer, but also lets a viewer sit further behind. The default is
+deliberately shallow — for a shared watch session, a straggler rebuffering and
+catching up beats them drifting 30s behind everyone else.
+
+Note that drift is the player's choice, not the server's. A viewer on a good
+connection always tracks the live edge, and never requests the deeper segments
+at all.
+
+Going below ~5s requires LL-HLS partial segments, which AVPro does not reliably
+support; sub-second needs WebRTC, which the VRChat players cannot consume.
 
 ## Design notes
 
