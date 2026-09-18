@@ -33,7 +33,7 @@ MAX_SEGMENTS = "8"
 # Ceiling on how many seconds the playlist may span, regardless of segment
 # count. Guards latency when the encoder emits segments longer than
 # SEGMENT_DURATION, which happens when its keyframe interval does not match.
-MAX_WINDOW_SECONDS = "6"
+MAX_WINDOW_SECONDS = "5"
 
 # Edge cache lifetime for the offline playlist. Ingest purges the entry when a
 # broadcast starts, but Cloudflare's cache is per-colo and the purge only runs

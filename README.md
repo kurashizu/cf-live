@@ -167,9 +167,10 @@ A wrong key returns `403`. Stream and file names are restricted to
 | `SEGMENT_DURATION` | `1` | Seconds per segment. Must match OBS's `hls_time` **and** its keyframe interval. |
 | `PLAYLIST_SIZE` | `3` | Segments advertised. The dominant latency term. |
 | `MAX_SEGMENTS` | `8` | Segments held in memory. Raised to `PLAYLIST_SIZE + 1` if set lower. Sets both jitter tolerance and worst-case latency. |
-| `MAX_WINDOW_SECONDS` | `6` | Ceiling on playlist span, guarding latency when segments come out longer than requested. |
+| `MAX_WINDOW_SECONDS` | `5` | Ceiling on playlist span, guarding latency when segments come out longer than requested. |
 | `OFFLINE_CACHE_TTL` | `3` | Edge cache for the offline playlist; worst case before a viewer notices a broadcast started. |
 | `SEGMENT_CACHE_TTL` | `30` | Edge cache for immutable segments. |
+| `LIVE_EDGE_START` | `1` | Advertise `EXT-X-START` so players begin near the live edge. Set to `0` to omit it. |
 | `PSEUDO_VOD` | `0` | Terminate playlists with `ENDLIST` for players that cannot follow a live playlist. See VRChat compatibility. |
 
 ## Latency
@@ -179,19 +180,24 @@ Measured end to end at the defaults (1s segments, 3 advertised):
 | | |
 |---|---|
 | Encoder fills one segment | 1.0s (unavoidable) |
-| Upload until readable | ~0.6s |
-| Window depth — oldest to newest entry | 2.0s |
-| Player's own buffer | 2-3s |
-| **Total** | **~3.6-6.6s** |
+| Upload until readable | ~0.3-0.6s |
+| Player's position behind the edge | ~1s, set by `EXT-X-START` |
+| **Total** | **~2.5s**, with the player reporting ~1.2s to the live edge |
 
-Note that a player's own latency readout (hls.js `latency`, and the figure in
-the preview UI) measures only the distance to the live edge and excludes
-encoding and upload, so it reads several seconds lower than what a viewer
-actually experiences.
+Three things get it there, none of which cost any requests — the poll rate
+depends only on `SEGMENT_DURATION`:
 
-`PLAYLIST_SIZE` is the knob that matters: a player starts at the oldest
-advertised segment, so each extra entry costs about one segment of delay.
-Going below ~3.5s needs LL-HLS partial segments, which AVPro does not reliably
+- **`EXT-X-START`** tells the player to begin one segment behind the live edge
+  rather than at the oldest advertised segment.
+- **A 3-segment window.** Two is worse, not better: measured with a 2-segment
+  window the latency was identical at 2.11s but playback stalled, because the
+  player had nothing left to buffer against jitter.
+- **`liveSyncDurationCount: 1`** in the bundled player, down from 3.
+
+A player's own latency readout measures only the distance to the live edge and
+excludes encoding and upload, so it reads lower than what a viewer sees.
+
+Going below ~2s needs LL-HLS partial segments, which AVPro does not reliably
 support; sub-second needs WebRTC, which the VRChat players cannot consume.
 
 **Keyframe interval must match.** `SEGMENT_DURATION` is a request, not a

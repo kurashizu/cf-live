@@ -22,11 +22,18 @@ export function landingPage(url, env) {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       // The page embeds its own script, so caching the HTML caches the player
-      // logic with it. A five-minute lifetime meant an ordinary reload kept
-      // running stale JavaScript and only a force-reload picked up fixes.
-      // Revalidate every time: the document is small and this is the control
-      // surface for the whole service.
-      'Cache-Control': 'no-cache, must-revalidate',
+      // logic with it — a stale copy meant an ordinary reload kept showing
+      // OFFLINE and only a force-reload recovered.
+      //
+      // Plain no-store, not "no-cache, must-revalidate": Cloudflare strips
+      // that combination on the way out, leaving the response with no caching
+      // directive at all, at which point a browser applies its own heuristics
+      // and caches it anyway. The same substitution was needed for the live
+      // playlist.
+      'Cache-Control': 'no-store',
+      // Belt and braces for intermediaries that predate Cache-Control.
+      'Pragma': 'no-cache',
+      'Expires': '0',
     },
   });
 }
@@ -609,8 +616,12 @@ function load() {
     // partial segments, which this plain-HLS playlist never provides.
     hls = new Hls({
       lowLatencyMode: false,
-      liveSyncDurationCount: 3,
-      maxBufferLength: 10,
+      // Sit one segment behind the live edge rather than three. Costs nothing
+      // in requests — the poll rate follows segment duration — and removes a
+      // couple of seconds. 1 is the floor: at 0 the player has nothing
+      // buffered ahead and stalls on the first jitter.
+      liveSyncDurationCount: 1,
+      maxBufferLength: 6,
       manifestLoadingMaxRetry: 999,  // the stream may not be live yet
       levelLoadingMaxRetry: 999,
       fragLoadingMaxRetry: 6,

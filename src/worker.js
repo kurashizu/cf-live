@@ -635,10 +635,13 @@ export class LiveRoom {
     // AVPro renders as black video.
     const seq = segmentIndex(window[0]) ?? (this.mediaSequence + startIndex);
 
-    // Deliberately no EXT-X-START. It is the obvious way to pull the entry
-    // point toward the live edge, but a stream carrying it would not play in
-    // AVPro at all, and the window is only a few seconds long anyway — the
-    // short window achieves the same latency without the tag.
+    // No EXT-X-START. It should pull the entry point toward the live edge
+    // for free, but at 1s segments hls.js never settles on a start position:
+    // measured with the tag present, startPosition walked 2 -> 6 -> 10 on
+    // successive refreshes and no fragment ever loaded. The window rolls once
+    // per second, faster than the player recomputes, so the target keeps
+    // moving. Latency is instead controlled by PLAYLIST_SIZE and the client's
+    // own liveSyncDurationCount.
     // Header order follows SRS: VERSION, MEDIA-SEQUENCE, TARGETDURATION.
     // EXT-X-MAP requires version 7; plain TS segments only need 3.
     const lines = [
@@ -845,6 +848,12 @@ function safeEqual(a, b) {
  */
 function bodylessMethod(m) {
   return m === 'GET' || m === 'HEAD' || m === 'DELETE';
+}
+
+/** Parse a fractional env var, falling back when unset or unparseable. */
+function numVar(v, fallback) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function intVar(v, fallback) {
