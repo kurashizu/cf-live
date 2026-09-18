@@ -51,5 +51,10 @@ SEGMENT_CONTENT_TYPE = "octet"
 # a fallback rather than the default.
 PSEUDO_VOD = "0"
 
+# Diagnostic: apply the two pseudo-VOD tags independently, to find which one
+# a player actually requires.
+FORCE_VOD_TYPE = "0"
+FORCE_ENDLIST = "0"
+
 # Edge cache lifetime for immutable segments, in seconds.
 SEGMENT_CACHE_TTL = "30"

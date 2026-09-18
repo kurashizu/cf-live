@@ -47,6 +47,18 @@ export default {
       if (path === '/' || path === '/index.html') return landingPage(url, env);
       if (path === '/healthz') return text('ok');
 
+      // Diagnostic: a live playlist served from the root, mirroring the layout
+      // of /_selftest.m3u8 (which plays) rather than /live/<s>/index.m3u8
+      // (which does not). Isolates whether the URL depth or the relative
+      // segment URIs matter to the player.
+      const flat = path.match(/^\/_flat_([A-Za-z0-9._-]+)\.m3u8$/);
+      if (flat) {
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return text('method not allowed', 405);
+        }
+        return roomFetch(env, flat[1], request, '/playlist?flat=1');
+      }
+
       // Diagnostic: the simplest possible playable stream — one segment,
       // fixed content, marked as finished. If a player cannot render this,
       // the problem is not in the live pipeline.
@@ -142,7 +154,7 @@ export default {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        return masterPlaylist(stream);
+        return masterPlaylist(stream, env);
       }
 
       // The offline slate. Served straight from the Worker with a long cache
@@ -201,7 +213,7 @@ export default {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        return masterPlaylist(alias[1]);
+        return masterPlaylist(alias[1], env);
       }
 
       return text('not found', 404);
@@ -255,7 +267,14 @@ async function serveSegment(env, stream, file, request, ctx) {
  * loading state instead. Declaring one variant costs nothing and makes the
  * stream look like every other HLS source such a player has seen.
  */
-function masterPlaylist(stream) {
+function masterPlaylist(stream, env) {
+  // When the player is one that stops at ENDLIST, the media playlist URL
+  // carries a cache-busting token. Re-reading the master then yields a URL
+  // the player has not seen finish, which is the only way to get such a
+  // player to continue past the end of a window.
+  const bust = env && env.PSEUDO_VOD === '1'
+    ? `?t=${Math.floor(Date.now() / 1000)}`
+    : '';
   const body = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
@@ -267,14 +286,15 @@ function masterPlaylist(stream) {
     '#EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1',
     // Relative to wherever the master was fetched from, which is always one
     // level above /live/<stream>/.
-    `live/${encodeURIComponent(stream)}/index.m3u8`,
+    `live/${encodeURIComponent(stream)}/index.m3u8${bust}`,
     '',
   ].join('\n');
   return new Response(body, {
     headers: {
       'Content-Type': M3U8,
-      // The master never changes for a given stream name.
-      'Cache-Control': 'public, max-age=300',
+      // Not cacheable when it carries a token: the point is that each read
+      // produces a different media playlist URL.
+      'Cache-Control': bust ? 'no-store' : 'public, max-age=300',
       'Access-Control-Allow-Origin': '*',
     },
   });
@@ -443,7 +463,10 @@ export class LiveRoom {
       return this.handleDash(request.headers.get('x-cf-live-stream') || 'main');
     }
     if (path === '/playlist') {
-      return this.handlePlaylist(request.headers.get('x-cf-live-stream') || 'main');
+      return this.handlePlaylist(
+        request.headers.get('x-cf-live-stream') || 'main',
+        url.searchParams.get('flat') === '1',
+      );
     }
     if (path.startsWith('/segment/')) {
       const file = decodeURIComponent(path.slice('/segment/'.length));
@@ -574,7 +597,11 @@ export class LiveRoom {
 
   // --- playback -------------------------------------------------------------
 
-  handlePlaylist(stream) {
+  handlePlaylist(stream, flat = false) {
+    // Count polls so a test can tell whether a player re-requests the
+    // playlist after reaching the end, or fetches it once and stops.
+    this.playlistHits = (this.playlistHits || 0) + 1;
+    this.lastPlaylistAt = Date.now();
     if (this.order.length === 0) {
       // No live content. Serve the "OFFLINE" slate as a *moving* live playlist
       // rather than a single static entry.
@@ -631,22 +658,23 @@ export class LiveRoom {
     // so entries never disappear from the top of the list. Some players lose
     // the timeline when the playlist they are following is truncated from the
     // front, and this isolates that behaviour.
-    // Pseudo-VOD terminates every playlist with ENDLIST. AVPro in VRChat
-    // renders a normal live playlist as black video but plays the same
-    // segments when the playlist claims to be finished, so this trades live
-    // semantics for actually being visible. It advertises the whole buffer
-    // rather than a trailing window, since such a player stops at the end of
-    // whatever it was given.
+    // Pseudo-VOD terminates every playlist with ENDLIST, because AVPro in
+    // VRChat renders a normal live playlist as black video but plays the same
+    // segments when the playlist claims to be finished.
+    //
+    // It still serves a trailing window rather than the whole buffer: the
+    // master playlist hands out a fresh, tokenised media-playlist URL on each
+    // read, so a player that stops at ENDLIST and comes back gets the current
+    // live edge. Advertising the whole buffer would instead pin it to the
+    // oldest segment and let latency grow without bound.
     const pseudoVod = this.env.PSEUDO_VOD === '1';
-    const window = pseudoVod
-      ? this.order.slice()
-      : trailingWindow(
-          this.order,
-          this.playlistSize,
-          this.durations,
-          this.targetDuration,
-          this.maxWindowSeconds,
-        );
+    const window = trailingWindow(
+      this.order,
+      this.playlistSize,
+      this.durations,
+      this.targetDuration,
+      this.maxWindowSeconds,
+    );
     const startIndex = this.order.length - window.length;
     // EXT-X-MEDIA-SEQUENCE must be monotonic across the whole life of the URL,
     // including the offline->live transition. The offline playlist numbers
@@ -676,10 +704,19 @@ export class LiveRoom {
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
     ];
-    if (pseudoVod) lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
-    if (this.discontinuitySequence > 0) {
-      lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${this.discontinuitySequence}`);
+    // Split for diagnosis: a player that needs one of these but not the
+    // other tells us whether it is refusing to poll (ENDLIST) or refusing to
+    // treat the stream as seekable (PLAYLIST-TYPE).
+    if (pseudoVod || this.env.FORCE_VOD_TYPE === '1') {
+      lines.push('#EXT-X-PLAYLIST-TYPE:VOD');
     }
+    // EXT-X-DISCONTINUITY-SEQUENCE is deliberately not emitted. A restart
+    // clears the ring, so the window always holds one continuous timeline and
+    // never contains an EXT-X-DISCONTINUITY to count. Publishing a non-zero
+    // count with no matching marker made hls.js compute a timeline offset of
+    // -91s: segments were fetched and appended, but at a negative position,
+    // so nothing ever played. The counter is still tracked for /status.
+
     // fMP4 segments are undecodable without the initialisation segment, so
     // it has to be declared before the first media segment.
     if (this.initSegment) {
@@ -707,24 +744,22 @@ export class LiveRoom {
       // /live/<stream>/<file>. Root-absolute paths are what every working
       // reference stream avoids, and AVPro would not play a playlist using
       // them.
-      lines.push(file);
+      // In flat mode the playlist is served from the root, so segment URIs
+      // need the full path rather than a bare filename.
+      lines.push(flat ? `live/${encodeURIComponent(stream)}/${file}` : file);
     });
-    if (pseudoVod) lines.push('#EXT-X-ENDLIST');
+    if (pseudoVod || this.env.FORCE_ENDLIST === '1') lines.push('#EXT-X-ENDLIST');
     lines.push('');
 
     return new Response(lines.join('\n'), {
       headers: {
         'Content-Type': M3U8,
-        // A live playlist must be revalidated on every poll, but *how* to say
-        // that differs by player. hls.js needs the response not to be reused
-        // from cache, or it sees an unchanged manifest and stops loading
-        // fragments. AVPro appears to read no-store as "do not fetch this
-        // again" and stops refreshing altogether, leaving black video.
-        //
-        // no-cache satisfies both: the response may be stored but must be
-        // revalidated before reuse, so every poll reaches the origin while
-        // still being a normal cacheable response.
-        'Cache-Control': 'no-cache, max-age=0, must-revalidate',
+        // Plain no-store. The previous value combined no-cache, max-age=0 and
+        // must-revalidate, and Cloudflare stripped the header entirely on the
+        // way out, leaving live playlists with no caching directive at all —
+        // so a player was free to reuse its first copy and never see the
+        // stream advance.
+        'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
       },
     });
@@ -832,6 +867,8 @@ export class LiveRoom {
       totalSegments: this.totalSegments,
       targetDuration: this.targetDuration,
       playlistSize: this.playlistSize,
+      playlistHits: this.playlistHits || 0,
+      secondsSinceLastPoll: this.lastPlaylistAt ? (Date.now() - this.lastPlaylistAt) / 1000 : -1,
       maxWindowSeconds: this.maxWindowSeconds,
       maxSegments: this.maxSegments,
       bufferedBytes: [...this.segments.values()].reduce((n, s) => n + s.bytes.byteLength, 0),
