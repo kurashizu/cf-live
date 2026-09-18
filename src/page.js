@@ -573,8 +573,27 @@ function load() {
 
 function jumpLive() {
   const v = document.getElementById('video');
-  if (hls && hls.liveSyncPosition != null) v.currentTime = hls.liveSyncPosition;
-  else if (v.seekable.length) v.currentTime = v.seekable.end(v.seekable.length - 1);
+
+  // Collect every candidate for "the live edge" and take the furthest one.
+  // hls.liveSyncPosition can be 0, negative or NaN before the player has
+  // synced, and seeking to that value rewinds to the start of the stream --
+  // which is the opposite of what this button is for.
+  const candidates = [];
+  if (hls && Number.isFinite(hls.liveSyncPosition)) {
+    candidates.push(hls.liveSyncPosition);
+  }
+  if (v.seekable.length) {
+    candidates.push(v.seekable.end(v.seekable.length - 1));
+  }
+  if (v.buffered.length) {
+    candidates.push(v.buffered.end(v.buffered.length - 1));
+  }
+
+  const target = Math.max(...candidates.filter((n) => Number.isFinite(n) && n > 0));
+  // Only seek forward: this button should never move playback backwards.
+  if (Number.isFinite(target) && target > v.currentTime) {
+    v.currentTime = target;
+  }
   v.play().catch(() => {});
 }
 
@@ -601,8 +620,11 @@ async function startStatus(name) {
       document.getElementById('s-bytes').textContent = fmtBytes(j.bufferedBytes);
       const v = document.getElementById('video');
       let lat = '–';
-      if (hls && hls.latency) lat = hls.latency.toFixed(1) + 's';
-      else if (v.seekable.length) {
+      // 0 is a legitimate latency (right at the edge), so test for a finite
+      // number rather than truthiness.
+      if (hls && Number.isFinite(hls.latency)) {
+        lat = hls.latency.toFixed(1) + 's';
+      } else if (v.seekable.length) {
         lat = Math.max(0, v.seekable.end(v.seekable.length - 1) - v.currentTime).toFixed(1) + 's';
       }
       document.getElementById('s-lat').textContent = lat;
