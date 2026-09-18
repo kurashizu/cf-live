@@ -40,8 +40,12 @@ For local development, put the key in `.dev.vars`:
 INGEST_KEY=your-local-dev-key
 ```
 
-then `npm run dev` and open http://localhost:8787 — the landing page renders the
-player, live stats, and OBS instructions with your actual URLs filled in.
+then `npm run dev` and open http://localhost:8787.
+
+The landing page is the setup UI: paste your ingest key into the field at the top
+and every command on the page — the OBS URL, muxer settings, encoder settings and
+the ffmpeg test command — is rewritten with the real key and can be copied with
+one click. The key is kept in `localStorage` only and is never transmitted.
 
 ## OBS configuration
 
@@ -91,11 +95,25 @@ upload failure instead of ending the recording.
 Put this in the VRChat video player:
 
 ```
-https://<your-worker>/live/main.m3u8
+https://<your-worker>/main
 ```
 
-Any stream name works and is created on demand, each backed by its own Durable
-Object. Push to `/ingest/<KEY>/room2/…` and play `/live/room2.m3u8`.
+Three URL forms serve the same playlist — use whichever suits the player:
+
+| URL | Notes |
+|---|---|
+| `https://<host>/main` | Shortest; easiest to type into VRChat |
+| `https://<host>/main.m3u8` | Use if a player insists on the extension |
+| `https://<host>/live/main.m3u8` | Explicit form |
+
+The bare `/<stream>` alias is served inline rather than redirected, because some
+players (AVPro among them) will not follow a 302 for a manifest. These names are
+reserved and cannot be used as stream names: `healthz`, `status`, `live`,
+`ingest`, `index.html`, `favicon.ico`, `robots.txt`, `sitemap.xml`,
+`apple-touch-icon.png`, `.well-known`.
+
+Any other stream name works and is created on demand, each backed by its own
+Durable Object. Push to `/ingest/<KEY>/room2/…` and play `/room2`.
 
 ## API
 
@@ -114,6 +132,8 @@ A wrong key returns `403`. Stream and file names are restricted to
 
 | Method | Path | Notes |
 |---|---|---|
+| `GET` | `/:stream` | Shortest playlist URL |
+| `GET` | `/:stream.m3u8` | Same playlist, with extension |
 | `GET` | `/live/:stream.m3u8` | Media playlist, sliding window, never cached |
 | `GET` | `/live/:stream/:file.ts` | Segment bytes, immutable, edge-cached |
 | `GET` | `/status/:stream` | JSON stream state |

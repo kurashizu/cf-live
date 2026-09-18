@@ -96,6 +96,23 @@ else
 fi
 
 echo
+echo "short alias routes"
+# The same playlist must be reachable from all three paths, and reserved
+# endpoints must never be shadowed by the /<stream> alias.
+for path in "/$STREAM" "/$STREAM.m3u8" "/live/$STREAM.m3u8"; do
+  if curl -fsS "$BASE$path" | grep -q '^#EXTM3U'; then
+    ok "$path serves the playlist"
+  else
+    bad "$path did not serve a playlist"
+  fi
+done
+for path in /healthz /status/$STREAM /; do
+  c=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE$path")
+  [ "$c" = "200" ] && ok "$path still reachable (alias did not shadow it)" \
+                   || bad "$path returned $c"
+done
+
+echo
 echo "auth and validation"
 code() { curl -sS -o /dev/null -w '%{http_code}' "$@"; }
 [ "$(code -X PUT -d x "$BASE/ingest/wrongkey/$STREAM/s.ts")" = "403" ] \

@@ -17,6 +17,17 @@
 
 import { landingPage } from './page.js';
 
+/**
+ * Paths that can never be a stream name, because the short alias route
+ * (/<stream>) would otherwise shadow a real endpoint or a browser's
+ * well-known request.
+ */
+const RESERVED_PATHS = new Set([
+  'healthz', 'status', 'live', 'ingest', 'index.html',
+  'favicon.ico', 'robots.txt', 'sitemap.xml', 'apple-touch-icon.png',
+  '.well-known',
+]);
+
 const TS = 'video/mp2t';
 const M3U8 = 'application/vnd.apple.mpegurl';
 
@@ -74,6 +85,19 @@ export default {
         const stream = status[1];
         if (!isSafeName(stream)) return text('bad name', 400);
         return roomFetch(env, stream, request, '/status');
+      }
+
+      // ---- short aliases ---------------------------------------------------
+      // /<stream> and /<stream>.m3u8 both serve the playlist, so a VRChat URL
+      // can be as short as https://host/main. Checked last so real endpoints
+      // always win, and served inline rather than redirected because some
+      // players (AVPro among them) will not follow a 302 for a manifest.
+      const alias = path.match(/^\/([^/]+?)(?:\.m3u8)?$/);
+      if (alias && !RESERVED_PATHS.has(alias[1].toLowerCase()) && isSafeName(alias[1])) {
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return text('method not allowed', 405);
+        }
+        return roomFetch(env, alias[1], request, '/playlist');
       }
 
       return text('not found', 404);
@@ -350,8 +374,10 @@ export class LiveRoom {
       if (file === this.discontinuityAt) lines.push('#EXT-X-DISCONTINUITY');
       const dur = this.durations.get(file) ?? this.targetDuration;
       lines.push(`#EXTINF:${dur.toFixed(6)},`);
-      // Relative to /live/<stream>.m3u8, so include the stream directory.
-      lines.push(`${encodeURIComponent(stream)}/${file}`);
+      // Root-absolute on purpose: this playlist is served from three paths
+      // (/live/<s>.m3u8, /<s>.m3u8 and /<s>), and a relative URI would
+      // resolve differently under each. An absolute path is correct for all.
+      lines.push(`/live/${encodeURIComponent(stream)}/${file}`);
     }
     lines.push('');
 
