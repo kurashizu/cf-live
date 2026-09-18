@@ -101,6 +101,7 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
   }
   button:hover { filter:brightness(1.07); }
   button.ghost { background:transparent; border-color:var(--line); color:var(--fg); }
+  button.flash { border-color:var(--accent); color:var(--accent); font-variant-numeric:tabular-nums; }
 
   /* ---- quick start ---- */
   .qs { background:var(--card); border:1px solid var(--line); border-radius:var(--radius);
@@ -221,7 +222,8 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
   <div class="controls">
     <input type="text" id="stream" value="main" placeholder="stream name">
     <button onclick="load()">Load</button>
-    <button class="ghost" onclick="jumpLive()">Jump to live</button>
+    <button class="ghost" id="btn-live" onclick="jumpLive()"
+            title="Skip ahead to the newest content without reloading the player">Jump to live</button>
     <span class="badge"><span class="led" id="led"></span><span id="livetext">not connected</span></span>
   </div>
   <video id="video" controls playsinline muted autoplay></video>
@@ -596,30 +598,53 @@ function load() {
   startStatus(name);
 }
 
+/**
+ * Seek to the furthest playable position without rebuilding the player.
+ *
+ * Deliberately does NOT use hls.liveSyncPosition: that is hls.js's own
+ * conservative sync point (held back by liveSyncDurationCount), so it is
+ * usually where playback already sits and seeking to it does nothing visible.
+ * The real edge is the end of what has been buffered.
+ */
 function jumpLive() {
   const v = document.getElementById('video');
+  const btn = document.getElementById('btn-live');
 
-  // Collect every candidate for "the live edge" and take the furthest one.
-  // hls.liveSyncPosition can be 0, negative or NaN before the player has
-  // synced, and seeking to that value rewinds to the start of the stream --
-  // which is the opposite of what this button is for.
-  const candidates = [];
-  if (hls && Number.isFinite(hls.liveSyncPosition)) {
-    candidates.push(hls.liveSyncPosition);
-  }
-  if (v.seekable.length) {
-    candidates.push(v.seekable.end(v.seekable.length - 1));
-  }
-  if (v.buffered.length) {
-    candidates.push(v.buffered.end(v.buffered.length - 1));
+  const ends = [];
+  if (v.buffered.length) ends.push(v.buffered.end(v.buffered.length - 1));
+  if (v.seekable.length) ends.push(v.seekable.end(v.seekable.length - 1));
+  const edge = Math.max(...ends.filter((n) => Number.isFinite(n) && n > 0));
+
+  if (!Number.isFinite(edge)) {
+    flashButton(btn, 'No stream', 'Jump to live');
+    v.play().catch(() => {});
+    return;
   }
 
-  const target = Math.max(...candidates.filter((n) => Number.isFinite(n) && n > 0));
-  // Only seek forward: this button should never move playback backwards.
-  if (Number.isFinite(target) && target > v.currentTime) {
+  // Land a fraction behind the very end: seeking exactly to the edge often
+  // stalls, because the player then has nothing buffered ahead of it.
+  const target = Math.max(0, edge - 0.3);
+  const gained = target - v.currentTime;
+
+  // Only seek forward, and only when it is worth the interruption.
+  if (gained > 0.5) {
     v.currentTime = target;
+    flashButton(btn, '-' + gained.toFixed(1) + 's', 'Jump to live');
+  } else {
+    flashButton(btn, 'Already live', 'Jump to live');
   }
   v.play().catch(() => {});
+}
+
+/** Briefly replace a button's label with a result, then restore it. */
+function flashButton(btn, text, restore) {
+  if (!btn) return;
+  btn.textContent = text;
+  btn.classList.add('flash');
+  setTimeout(() => {
+    btn.textContent = restore;
+    btn.classList.remove('flash');
+  }, 1300);
 }
 
 function fmtBytes(n) {
