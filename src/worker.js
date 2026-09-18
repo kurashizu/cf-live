@@ -205,6 +205,12 @@ export class LiveRoom {
     /** Target duration in seconds, from config. */
     this.targetDuration = intVar(env.SEGMENT_DURATION, 1);
     this.playlistSize = Math.max(1, intVar(env.PLAYLIST_SIZE, 4));
+    // Hard ceiling on how much wall-clock time the playlist may span, so a
+    // mis-sized segment cannot inflate startup latency without bound.
+    this.maxWindowSeconds = Math.max(
+      this.targetDuration,
+      intVar(env.MAX_WINDOW_SECONDS, 10),
+    );
     // The ring must hold at least one segment more than the playlist
     // advertises, or eviction would drop a segment the playlist still points
     // at and viewers would get a 404 for it. Enforced rather than documented,
@@ -357,8 +363,18 @@ export class LiveRoom {
       });
     }
 
-    // Serve a trailing window of the buffer.
-    const window = this.order.slice(-this.playlistSize);
+    // Serve a trailing window, bounded by BOTH a segment count and a total
+    // duration. The duration bound matters when the encoder's keyframe
+    // interval does not match hls_time: segments then come out several times
+    // longer than requested, and a fixed count would stretch the window to
+    // tens of seconds and dominate the latency budget.
+    const window = trailingWindow(
+      this.order,
+      this.playlistSize,
+      this.durations,
+      this.targetDuration,
+      this.maxWindowSeconds,
+    );
     const startIndex = this.order.length - window.length;
     // EXT-X-MEDIA-SEQUENCE must identify the first segment in the window on the
     // same numbering the segments themselves use. ffmpeg's seg%05d counter is
@@ -377,9 +393,13 @@ export class LiveRoom {
     // segment in hand, but not scaled to a multiple of the segment duration —
     // at 4s segments a "two segment" rule would push the entry point 8s back
     // and dominate the latency budget.
+    // Hold back just enough for the player to have a segment in hand. Capped
+    // in absolute seconds as well as by the window, so an oversized segment
+    // cannot push the entry point far back.
     const startOffset = Math.min(
       windowDuration(window, this.durations, this.targetDuration),
       this.targetDuration + 1,
+      6,
     );
     const lines = [
       '#EXTM3U',
@@ -446,6 +466,7 @@ export class LiveRoom {
       totalSegments: this.totalSegments,
       targetDuration: this.targetDuration,
       playlistSize: this.playlistSize,
+      maxWindowSeconds: this.maxWindowSeconds,
       maxSegments: this.maxSegments,
       bufferedBytes: [...this.segments.values()].reduce((n, s) => n + s.bytes.byteLength, 0),
       // Always a number so consumers can compare without null-checking; -1
@@ -459,6 +480,25 @@ export class LiveRoom {
 // =============================================================================
 // helpers
 // =============================================================================
+
+/**
+ * Take the newest segments, stopping at whichever limit is hit first: the
+ * segment count, or the total duration. Always returns at least one segment,
+ * since an empty window would be an invalid live playlist.
+ */
+function trailingWindow(order, maxCount, durations, fallback, maxSeconds) {
+  const picked = [];
+  let total = 0;
+  for (let i = order.length - 1; i >= 0; i--) {
+    const file = order[i];
+    const dur = durations.get(file) ?? fallback;
+    if (picked.length >= maxCount) break;
+    if (picked.length > 0 && total + dur > maxSeconds) break;
+    picked.unshift(file);
+    total += dur;
+  }
+  return picked;
+}
 
 /** Total duration of a playlist window, for computing a live-edge offset. */
 function windowDuration(files, durations, fallback) {

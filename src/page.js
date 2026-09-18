@@ -110,6 +110,9 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
   .qs li:first-child { margin-top:.2rem; }
   .qs .what { font-weight:600; font-size:.9rem; }
   .qs .where { font-size:.8rem; color:var(--muted); margin-bottom:.1rem; }
+  .qs .hint-sm { font-size:.8rem; color:var(--muted); margin-top:.3rem; line-height:1.5; }
+  .warn-inline { font-size:.75rem; font-weight:600; color:var(--accent);
+                 border:1px solid var(--accent); border-radius:4px; padding:.05rem .35rem; }
 
   /* ---- player ---- */
   .player-card { background:var(--card); border:1px solid var(--line);
@@ -195,6 +198,16 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
       <div class="snip"><pre><code id="qs-mux"></code></pre></div>
     </li>
     <li>
+      <div class="where">Same screen → <b>Keyframe interval (frames)</b> — its own
+        numeric field, below Video Bitrate</div>
+      <div class="what">Set to <code id="qs-gop"></code> &nbsp;<span class="warn-inline">most
+        important setting on this page</span></div>
+      <div class="hint-sm">OBS defaults this to <code>249</code>, which forces
+        ~8s segments no matter what <code>hls_time</code> says — segments can only
+        be cut on a keyframe. This field overrides any <code>g=</code> you put in
+        the encoder settings, so it must be set here.</div>
+    </li>
+    <li>
       <div class="where">Press <b>Start Recording</b>, then in VRChat</div>
       <div class="what">Paste into the video player</div>
       <div class="snip"><pre><code id="qs-play"></code></pre></div>
@@ -254,6 +267,11 @@ type into VRChat; the <code>.m3u8</code> form is safest if a player insists on t
       <td><div class="cfgval"><code id="f-fmt">hls</code><button class="minicopy" data-copy="f-fmt">Copy</button></div></td></tr>
   <tr><td>Muxer Settings</td>
       <td><div class="cfgval"><code id="f-mux"></code><button class="minicopy" data-copy="f-mux">Copy</button></div></td></tr>
+  <tr><td><b>Keyframe interval (frames)</b><br>
+          <span class="small muted">own numeric field, not encoder settings</span></td>
+      <td><div class="cfgval"><code id="f-gop"></code><button class="minicopy" data-copy="f-gop">Copy</button></div></td></tr>
+  <tr><td>Video Bitrate</td>
+      <td><div class="cfgval"><code id="f-rate">2500</code><button class="minicopy" data-copy="f-rate">Copy</button></div></td></tr>
   <tr><td>Video Encoder</td>
       <td><div class="cfgval"><code id="f-venc">libx264</code><button class="minicopy" data-copy="f-venc">Copy</button></div></td></tr>
   <tr><td>Video Encoder Settings</td>
@@ -262,13 +280,18 @@ type into VRChat; the <code>.m3u8</code> form is safest if a player insists on t
       <td><div class="cfgval"><code id="f-aenc">aac</code><button class="minicopy" data-copy="f-aenc">Copy</button></div></td></tr>
 </table>
 
-<p class="small muted">
-  In the video encoder settings, <code>g</code> = frame rate × segment duration.
-  At ${segDur}s segments: 30 fps → <code>g=${30 * segDur}</code>,
-  60 fps → <code>g=${60 * segDur}</code>. The value above assumes 30 fps —
-  change it if you stream at 60. A keyframe interval that does not divide the
-  segment duration prevents clean segment cuts.
-</p>
+<div class="note">
+  <b>Keyframe interval is the setting that actually controls latency.</b>
+  A segment can only be cut on a keyframe, so if keyframes are 8s apart,
+  <code>hls_time=${segDur}</code> is ignored and you get 8s segments — which is
+  what turns a ${segDur}s configuration into 20-30s of observed latency.
+  <br><br>
+  OBS ships with <code>249</code> frames here. Set it to
+  <b>frame rate × ${segDur}</b>: <code>${30 * segDur}</code> at 30 fps,
+  <code>${60 * segDur}</code> at 60 fps. The dedicated
+  <b>Keyframe interval</b> field wins over any <code>g=</code> in the encoder
+  settings box, so setting it there alone has no effect.
+</div>
 
 <h3>Recommended settings</h3>
 <ul class="small">
@@ -471,6 +494,8 @@ function render() {
   setText('f-url', ingestUrl(n, k));
   setText('f-mux', muxerSettings(n, k));
   setText('f-vset', videoEncoderSettings());
+  setText('f-gop', String(30 * SEG_DUR));
+  setText('qs-gop', String(30 * SEG_DUR));
 
   setText('cmd-ffmpeg', ffmpegCommand(n, k));
   setText('cmd-verify', verifyCommand(n));

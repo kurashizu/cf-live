@@ -61,26 +61,40 @@ Settings → Output → Output Mode: **Advanced** → **Recording** tab:
 | FFmpeg Output Type | `Output to URL` |
 | File path or URL | `https://<your-worker>/ingest/<KEY>/main/live.m3u8` |
 | Container Format | `hls` |
+| **Keyframe interval (frames)** | **`60`** — see below, this one controls latency |
+| Video Bitrate | `2500` Kbps |
 | Video Encoder | `libx264` |
 | Audio Encoder | `aac` |
 
 **Muxer Settings** (one line):
 
 ```
-method=PUT http_persistent=1 ignore_io_errors=1 hls_time=1 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<your-worker>/ingest/<KEY>/main/seg%05d.ts
+method=PUT http_persistent=1 ignore_io_errors=1 hls_time=2 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<your-worker>/ingest/<KEY>/main/seg%05d.ts
 ```
 
-**Video Encoder Settings** — the keyframe interval must equal the segment
-duration, or segments cannot be cut cleanly:
+**Keyframe interval** is the setting that actually determines latency, and OBS
+gets it wrong by default.
+
+A segment can only be cut on a keyframe. OBS ships with **249** frames in the
+`Keyframe interval (frames)` field, which is ~8s at 30 fps — so `hls_time=2` is
+ignored and you get 8s segments. That alone turns a 2s configuration into
+20-30s of observed latency.
+
+Set it to **frame rate × segment duration**: `60` at 30 fps, `120` at 60 fps.
+
+> The `Keyframe interval (frames)` field is a separate numeric input in the
+> FFmpeg output panel, and it overrides any `g=` written in Video Encoder
+> Settings. Setting `g=` alone has no effect.
+
+**Video Encoder Settings** (optional, for latency and compatibility):
 
 ```
-preset=veryfast tune=zerolatency profile=main bf=0 g=30 keyint_min=30 sc_threshold=0
+preset=veryfast tune=zerolatency profile=main bf=0 sc_threshold=0
 ```
 
-`g` = frame rate × `hls_time`. At 1s segments: 30 fps → `g=30`, 60 fps → `g=60`.
-
-`ignore_io_errors=1` matters: it keeps a long broadcast alive through a transient
-upload failure instead of ending the recording.
+`ignore_io_errors=1` in the muxer settings matters too: it keeps a long
+broadcast alive through a transient upload failure instead of ending the
+recording.
 
 ### Recommended encoder settings
 
@@ -148,6 +162,7 @@ A wrong key returns `403`. Stream and file names are restricted to
 | `SEGMENT_DURATION` | `2` | Seconds per segment. Must match OBS's `hls_time`. |
 | `MAX_SEGMENTS` | `6` | Segments held in memory. Raised automatically to `PLAYLIST_SIZE + 1` if set lower. |
 | `PLAYLIST_SIZE` | `4` | Segments advertised in the playlist. |
+| `MAX_WINDOW_SECONDS` | `8` | Ceiling on how many seconds the playlist may span. Guards startup latency when the encoder emits segments longer than `SEGMENT_DURATION`. |
 | `SEGMENT_CACHE_TTL` | `30` | Edge cache lifetime for immutable segments. |
 
 ## Latency and tolerance
@@ -208,9 +223,9 @@ restarts, and a mismatch makes players miscompute the live edge.
 ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
        -f lavfi -i sine=frequency=440 \
   -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -bf 0 \
-  -g 30 -keyint_min 30 -sc_threshold 0 -b:v 2500k -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 -b:v 2500k -pix_fmt yuv420p \
   -c:a aac -b:a 128k -ar 48000 -ac 2 \
-  -f hls -hls_time 1 -hls_list_size 6 \
+  -f hls -hls_time 2 -hls_list_size 6 \
   -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
   -method PUT -http_persistent 1 -ignore_io_errors 1 \
   -hls_segment_filename "http://localhost:8787/ingest/$INGEST_KEY/main/seg%05d.ts" \
