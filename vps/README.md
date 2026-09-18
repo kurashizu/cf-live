@@ -1,5 +1,21 @@
 # cf-live on a VPS
 
+> Deployed and verified on Oracle Linux 9.7 (1 core, 1 GB) behind a Cloudflare
+> tunnel. Ingest and playback both work end to end. One thing still needs doing
+> by hand: the Cache Rule in the section below — without it every viewer
+> request reaches the box.
+
+## What actually runs
+
+Not nginx. The target machine could not install packages without falling over,
+and Caddy — already present — has a read-only file server, so it cannot accept
+OBS's uploads. `cf-live.py` is a relay in the Python standard library instead:
+no packages, no build, ~320 lines.
+
+It receives HLS segments over HTTP PUT, writes them to tmpfs, and serves them
+with the playlist format and cache headers established during the Workers
+build. systemd keeps it alive and recreates the tmpfs tree on boot.
+
 The same service without the Workers free-tier request limit. Needs only
 **nginx** (with the dav module) and **cloudflared** — no RTMP module, no
 transcoder, no media server.
