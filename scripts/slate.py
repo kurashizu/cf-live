@@ -40,6 +40,14 @@ F = {
  'V':["10001","10001","10001","10001","10001","01010","00100"],
  'W':["10001","10001","10001","10101","10101","11011","10001"],
  'Z':["11111","00001","00010","00100","01000","10000","11111"],
+ 'P':["11110","10001","10001","11110","10000","10000","10000"],
+ 'U':["10001","10001","10001","10001","10001","10001","01110"],
+ 'Y':["10001","10001","01010","00100","00100","00100","00100"],
+ 'B':["11110","10001","10001","11110","10001","10001","11110"],
+ 'J':["00111","00010","00010","00010","00010","10010","01100"],
+ 'Q':["01110","10001","10001","10001","10101","10010","01101"],
+ 'X':["10001","10001","01010","00100","01010","10001","10001"],
+ '-':["00000","00000","00000","11111","00000","00000","00000"],
  '.':["00000","00000","00000","00000","00000","01100","01100"],
  ':':["00000","01100","01100","00000","01100","01100","00000"],
  '/':["00001","00010","00010","00100","01000","01000","10000"],
@@ -62,10 +70,15 @@ def render(frame):
             for x in range(max(0, x0), min(W, x1)):
                 px(x, y, c)
 
-    def text(s, cx, cy, scale, color, track=1):
+    def text_width(s, scale, track=1):
+        """Rendered width in pixels, so callers can align blocks by edge."""
+        return len(s) * (5 + track) * scale - track * scale
+
+    def text(s, cx, cy, scale, color, track=1, align='center'):
         gw = (5 + track) * scale
-        total = len(s) * gw - track * scale
-        x0 = cx - total // 2
+        total = text_width(s, scale, track)
+        x0 = cx if align == 'left' else (cx - total if align == 'right'
+                                         else cx - total // 2)
         y0 = cy - (7 * scale) // 2
         for i, ch in enumerate(s.upper()):
             g = F.get(ch)
@@ -110,15 +123,26 @@ def render(frame):
         cx = W//2 - 30 + k * 30
         rect(cx - 4, 340, cx + 4, 348, c)
 
-    # Watermark, top-left. Dim enough not to compete with the message.
-    text("KRSZ LIVE", 118, 40, 2, blend(BG, ACCENT, 0.75), track=1)
+    # Top-left lockup. The tagline is letter-spaced to match the width of the
+    # line above it, so the two form an aligned block rather than two
+    # independently centred strings.
+    WM_X, WM_SCALE = 40, 2
+    brand = "KRSZ LIVE"
+    tag = "PURELY SERVERLESS"
+    brand_w = text_width(brand, WM_SCALE, 1)
+    # Solve for the tracking that makes the tagline span the same width:
+    #   len*(5+t)*s - t*s = brand_w  ->  t = (brand_w/s - 5*len) / (len - 1)
+    tag_scale = 1
+    tag_track = max(1, round((brand_w / tag_scale - 5 * len(tag)) / (len(tag) - 1)))
+    text(brand, WM_X, 40, WM_SCALE, blend(BG, ACCENT, 0.75), track=1, align='left')
+    text(tag, WM_X, 62, tag_scale, DIM, track=tag_track, align='left')
 
     text("OFFLINE", W//2, 190, 7, FG)
     text("WAITING FOR STREAM", W//2, 258, 3, DIM)
 
-    # Attribution at the bottom, with a rule above it.
-    rect(W//2 - 110, 392, W//2 + 110, 393, DIM)
-    text("KRSZ.IN", W//2, 430, 4, ACCENT)
+    # Attribution, bottom-right, same size as the top-left brand.
+    text("HTTPS://KRSZ.IN", W - 40, H - 40, WM_SCALE,
+         blend(BG, ACCENT, 0.75), track=1, align='right')
 
     raw = b''.join(b'\x00' + bytes(r) for r in rows)
 

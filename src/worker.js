@@ -69,6 +69,17 @@ export default {
       }
 
       // ---- playback --------------------------------------------------------
+      // /live/<stream>/index.m3u8 — the media playlist a master points at.
+      const media = path.match(/^\/live\/([^/]+)\/index\.m3u8$/);
+      if (media) {
+        const stream = media[1];
+        if (!isSafeName(stream)) return text('bad name', 400);
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          return text('method not allowed', 405);
+        }
+        return servePlaylist(env, stream, request, ctx);
+      }
+
       // /live/<stream>.m3u8
       const playlist = path.match(/^\/live\/([^/]+)\.m3u8$/);
       if (playlist) {
@@ -77,13 +88,15 @@ export default {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        return servePlaylist(env, stream, request, ctx);
+        return masterPlaylist(stream);
       }
 
       // The offline slate. Served straight from the Worker with a long cache
       // lifetime — it never changes, so it must never reach a Durable Object.
       // This is what makes an idle viewer free after the first request.
-      const slate = path.match(/^\/live\/_offline(?:\.([0-9a-f]{8}))?\.ts$/);
+      // /live/_offline.<version>.<sequence>.ts — the sequence only makes the
+      // URL unique per playlist slot; every one serves the same bytes.
+      const slate = path.match(/^\/live\/_offline(?:\.([0-9a-f]{8}))?(?:\.\d+)?\.ts$/);
       if (slate) {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
@@ -134,7 +147,7 @@ export default {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        return servePlaylist(env, alias[1], request, ctx);
+        return masterPlaylist(alias[1]);
       }
 
       return text('not found', 404);
@@ -177,6 +190,37 @@ async function serveSegment(env, stream, file, request, ctx) {
   const cacheWrite = cache.put(cacheKey, new Response(bytes, { headers }));
   if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(cacheWrite);
   return new Response(bytes, { headers });
+}
+
+/**
+ * A master playlist pointing at the stream's single media playlist.
+ *
+ * Players in the VRChat ecosystem are used to being handed a master: AVPro
+ * reads codec and resolution hints from EXT-X-STREAM-INF before it will
+ * commit to a rendition, and given a bare media playlist some builds sit in a
+ * loading state instead. Declaring one variant costs nothing and makes the
+ * stream look like every other HLS source such a player has seen.
+ */
+function masterPlaylist(stream) {
+  const body = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    // avc1.4d401f = H.264 Main 3.1, mp4a.40.2 = AAC-LC: what the OBS
+    // instructions produce. Bandwidth is a hint, not a promise.
+    '#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.4d401f,mp4a.40.2"',
+    // Relative to wherever the master was fetched from, which is always one
+    // level above /live/<stream>/.
+    `live/${encodeURIComponent(stream)}/index.m3u8`,
+    '',
+  ].join('\n');
+  return new Response(body, {
+    headers: {
+      'Content-Type': M3U8,
+      // The master never changes for a given stream name.
+      'Cache-Control': 'public, max-age=300',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
 }
 
 /**
@@ -296,6 +340,7 @@ export class LiveRoom {
     this.startedAt = 0;
     this.totalSegments = 0;
     this.pendingDiscontinuity = false;
+    this.sequenceBase = 0;
 
     /**
      * Restore the metadata that must outlive eviction. Segments deliberately
@@ -316,6 +361,7 @@ export class LiveRoom {
       this.startedAt = meta.startedAt ?? 0;
       // Every segment from before the eviction is gone from memory, so the
       // next ingest necessarily starts a new, discontinuous timeline.
+      this.sequenceBase = meta.sequenceBase ?? 0;
       this.pendingDiscontinuity = this.lastIngestAt > 0;
     });
   }
@@ -361,6 +407,13 @@ export class LiveRoom {
       this.pendingDiscontinuity = true;
     }
     if (!this.startedAt) this.startedAt = now;
+    // Pin the sequence base the first time content arrives, so live numbering
+    // continues past whatever the offline playlist had reached rather than
+    // restarting at zero. The margin covers the window the offline playlist
+    // was advertising when the switch happened.
+    if (!this.sequenceBase) {
+      this.sequenceBase = offlineSequence() + this.playlistSize + 1;
+    }
     this.lastIngestAt = now;
 
     if (file.endsWith('.m3u8')) {
@@ -402,6 +455,7 @@ export class LiveRoom {
       discontinuitySequence: this.discontinuitySequence,
       totalSegments: this.totalSegments,
       startedAt: this.startedAt,
+      sequenceBase: this.sequenceBase,
     });
 
     return text('ok');
@@ -437,28 +491,47 @@ export class LiveRoom {
 
   handlePlaylist(stream) {
     if (this.order.length === 0) {
-      // No live content. Serve a playable "OFFLINE" slate rather than an empty
-      // playlist: an empty one shows viewers nothing and makes every player
-      // poll forever, and a 404 makes AVPro give up permanently.
+      // No live content. Serve the "OFFLINE" slate as a *moving* live playlist
+      // rather than a single static entry.
       //
-      // The slate is identical on every request, so unlike a live playlist it
-      // can be cached at the edge. That is what stops idle viewers from
-      // draining request quota — previously a single page left open cost
-      // ~0.67 req/s indefinitely.
+      // A one-segment playlist with a fixed MEDIA-SEQUENCE looks finished to a
+      // player: it plays the 2s slate once, sees nothing new on reload, and
+      // stops. Advancing the sequence with wall-clock time and advertising a
+      // full window makes the slate behave like any other live stream, so it
+      // loops indefinitely and — crucially — the player keeps polling, which
+      // is what lets it pick up the real broadcast when it starts.
+      //
+      // The same slate segment is repeated under rotating sequence numbers.
+      // It is byte-identical every time, so it stays cheap to serve: one
+      // immutable object in the edge cache regardless of how long anyone
+      // waits.
       const ttl = intVar(this.env.OFFLINE_CACHE_TTL, 10);
-      const body = [
+      const count = this.playlistSize;
+      // Derived from the clock so every viewer, and every poll, sees the same
+      // window advance at the same rate without the DO holding any state.
+      const seq = offlineSequence();
+      const lines = [
         '#EXTM3U',
         '#EXT-X-VERSION:3',
         `#EXT-X-TARGETDURATION:${Math.ceil(SLATE_DURATION)}`,
-        '#EXT-X-MEDIA-SEQUENCE:0',
-        `#EXTINF:${SLATE_DURATION.toFixed(6)},`,
-        `/live/_offline.${SLATE_VERSION}.ts`,
-        '',
-      ].join('\n');
-      return new Response(body, {
+        `#EXT-X-MEDIA-SEQUENCE:${seq}`,
+      ];
+      for (let i = 0; i < count; i++) {
+        lines.push(`#EXTINF:${SLATE_DURATION.toFixed(6)},`);
+        // Distinct URL per slot: players dedupe by URI, and repeating one
+        // would be read as the same segment already played rather than the
+        // next one in the timeline.
+        // Relative to /live/<stream>/index.m3u8, so ../ lands in /live/.
+        lines.push(`../_offline.${SLATE_VERSION}.${seq + i}.ts`);
+      }
+      lines.push('');
+      return new Response(lines.join('\n'), {
         headers: {
           'Content-Type': M3U8,
-          'Cache-Control': `public, max-age=${ttl}`,
+          // Cache for less than one segment, so the sequence keeps advancing
+          // for viewers while still collapsing bursts of polls into one
+          // origin hit.
+          'Cache-Control': `public, max-age=${Math.min(ttl, Math.floor(SLATE_DURATION))}`,
           'Access-Control-Allow-Origin': '*',
         },
       });
@@ -477,37 +550,28 @@ export class LiveRoom {
       this.maxWindowSeconds,
     );
     const startIndex = this.order.length - window.length;
-    // EXT-X-MEDIA-SEQUENCE must identify the first segment in the window on the
-    // same numbering the segments themselves use. ffmpeg's seg%05d counter is
-    // authoritative; our own eviction count drifts away from it whenever the
-    // encoder restarts, and a mismatch makes players miscompute the live edge
-    // and refuse to load fragments.
-    const seq = segmentIndex(window[0]) ?? (this.mediaSequence + startIndex);
-
-    // Tell the player where to start. Without EXT-X-START, players pick their
-    // own entry point and conservative ones (AVPro/ExoPlayer) begin at the
-    // oldest segment in the window and then buffer further on top, which is
-    // what turns a 6s window into 20-30s of observed latency.
+    // EXT-X-MEDIA-SEQUENCE must be monotonic across the whole life of the URL,
+    // including the offline->live transition. The offline playlist numbers
+    // itself from wall-clock time (a large number), so restarting from
+    // ffmpeg's seg%05d counter would make the sequence collapse from hundreds
+    // of millions to zero. Players read that as a different stream and stop
+    // following it, which is why a viewer had to force-reload to see a
+    // broadcast start.
     //
-    // Offset is negative = measured back from the live edge. Hold back a
-    // little over one segment: enough that the player starts with a whole
-    // segment in hand, but not scaled to a multiple of the segment duration —
-    // at 4s segments a "two segment" rule would push the entry point 8s back
-    // and dominate the latency budget.
-    // Hold back just enough for the player to have a segment in hand. Capped
-    // in absolute seconds as well as by the window, so an oversized segment
-    // cannot push the entry point far back.
-    const startOffset = Math.min(
-      windowDuration(window, this.durations, this.targetDuration),
-      this.targetDuration + 1,
-      6,
-    );
+    // Offset the encoder's counter past the offline numbering, pinned at the
+    // moment ingest began so it stays stable for the rest of the broadcast.
+    const localSeq = segmentIndex(window[0]) ?? (this.mediaSequence + startIndex);
+    const seq = this.sequenceBase + localSeq;
+
+    // Deliberately no EXT-X-START. It is the obvious way to pull the entry
+    // point toward the live edge, but a stream carrying it would not play in
+    // AVPro at all, and the window is only a few seconds long anyway — the
+    // short window achieves the same latency without the tag.
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       `#EXT-X-TARGETDURATION:${this.targetDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${seq}`,
-      `#EXT-X-START:TIME-OFFSET=-${startOffset.toFixed(3)},PRECISE=YES`,
     ];
     if (this.discontinuitySequence > 0) {
       lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${this.discontinuitySequence}`);
@@ -520,7 +584,12 @@ export class LiveRoom {
       // Root-absolute on purpose: this playlist is served from three paths
       // (/live/<s>.m3u8, /<s>.m3u8 and /<s>), and a relative URI would
       // resolve differently under each. An absolute path is correct for all.
-      lines.push(`/live/${encodeURIComponent(stream)}/${file}`);
+      // Relative URI. The media playlist is only served from
+      // /live/<stream>/index.m3u8, so a bare filename resolves to
+      // /live/<stream>/<file>. Root-absolute paths are what every working
+      // reference stream avoids, and AVPro would not play a playlist using
+      // them.
+      lines.push(file);
     }
     lines.push('');
 
@@ -604,6 +673,29 @@ function trailingWindow(order, maxCount, durations, fallback, maxSeconds) {
 /** Total duration of a playlist window, for computing a live-edge offset. */
 function windowDuration(files, durations, fallback) {
   return files.reduce((n, f) => n + (durations.get(f) ?? fallback), 0);
+}
+
+/**
+ * The offline playlist's media sequence: wall-clock time in slate-length
+ * units. Shared with the live path so live numbering can continue past it
+ * instead of resetting, which would break the transition for players.
+ */
+/**
+ * Media sequence for the offline playlist.
+ *
+ * It has to advance with time so the playlist looks live and players keep
+ * polling, but it must also stay small: values in the hundreds of millions
+ * make some players — AVPro among them — stall rather than play. Wrapping at
+ * a large-but-safe modulus keeps the number under a million while still
+ * advancing once per slate length.
+ *
+ * The wrap is harmless in practice: it happens once every ~23 days of
+ * continuous offline time, and a player that sees the rollover simply treats
+ * it as a new stream, which is the correct outcome for a feed nobody is
+ * watching.
+ */
+function offlineSequence() {
+  return Math.floor(Date.now() / 1000 / SLATE_DURATION) % 1_000_000;
 }
 
 /** Extract ffmpeg's numeric counter from a segment filename, e.g. seg00042.ts -> 42. */

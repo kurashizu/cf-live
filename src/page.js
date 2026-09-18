@@ -17,7 +17,12 @@ export function landingPage(url, env) {
   return new Response(html({ origin, segDur, playlistSize, maxSegs, estLatency }), {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'public, max-age=300',
+      // The page embeds its own script, so caching the HTML caches the player
+      // logic with it. A five-minute lifetime meant an ordinary reload kept
+      // running stale JavaScript and only a force-reload picked up fixes.
+      // Revalidate every time: the document is small and this is the control
+      // surface for the whole service.
+      'Cache-Control': 'no-cache, must-revalidate',
     },
   });
 }
@@ -237,8 +242,10 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
 </div>
 
 <h3>Playback URLs</h3>
-<p class="small muted">All three serve the same playlist. The shortest form is easiest to
-type into VRChat; the <code>.m3u8</code> form is safest if a player insists on the extension.</p>
+<p class="small muted">All three serve a master playlist pointing at the live
+media playlist — the shape players in the VRChat ecosystem expect. The shortest
+form is easiest to type in; the <code>.m3u8</code> form is safest if a player
+insists on the extension.</p>
 <table class="cfg">
   <tr><td class="small muted" style="white-space:nowrap">shortest</td>
       <td><div class="cfgval"><code id="u-short"></code><button class="minicopy" data-copy="u-short">Copy</button></div></td></tr>
@@ -347,6 +354,9 @@ limited to <code>[A-Za-z0-9._-]</code>, max 128 characters.</p>
   <tr><td><span class="method get">GET</span></td>
       <td><code>/live/:stream.m3u8</code></td>
       <td>Explicit form. ${playlistSize}-segment sliding window, never cached.</td></tr>
+  <tr><td><span class="method get">GET</span></td>
+      <td><code>/live/:stream/index.m3u8</code></td>
+      <td>The media playlist the master points at. Sliding window, never cached.</td></tr>
   <tr><td><span class="method get">GET</span></td>
       <td><code>/live/:stream/:file.ts</code></td>
       <td>Segment bytes. Immutable, so edge-cached — only the first viewer per

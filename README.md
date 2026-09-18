@@ -120,6 +120,11 @@ Three URL forms serve the same playlist — use whichever suits the player:
 | `https://<host>/main.m3u8` | Use if a player insists on the extension |
 | `https://<host>/live/main.m3u8` | Explicit form |
 
+All three return a **master playlist** naming one variant, which points at
+`/live/main/index.m3u8`. AVPro reads codec and resolution hints from
+`EXT-X-STREAM-INF` before committing to a rendition, and handed a bare media
+playlist some builds sit in a loading state instead of playing.
+
 The bare `/<stream>` alias is served inline rather than redirected, because some
 players (AVPro among them) will not follow a 302 for a manifest. These names are
 reserved and cannot be used as stream names: `healthz`, `status`, `live`,
