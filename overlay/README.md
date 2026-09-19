@@ -13,8 +13,13 @@ The server hosts it, so there is no file to manage:
 
 1. Sources → **+** → **Browser**
 2. Leave **Local file** unticked and paste the URL:
-   `https://live.krsz.in/overlay?live=1&clock=1&tzlabel=SYD`
-3. Width `1920`, Height `1080`
+   `https://live.krsz.in/overlay?bar=1&live=1&clock=1&tzlabel=SYD`
+3. Width `1280`, Height `720` to match the stream
+
+The bar layout (`bar=1`) draws its own background band, so it stays readable
+over bright footage; the corner layout relies on the picture behind it being
+dark. Either pins itself to the real canvas edges, so resizing the source in
+OBS keeps the mark against the edge at any aspect ratio.
 4. Leave **Shutdown source when not visible** unticked, so the animation does
    not restart every scene change.
 
@@ -38,6 +43,9 @@ Append them to the URL, e.g.
 | `clock` | `0` | `1` adds a running clock (handy for proving latency on stream) |
 | `fade` | `0.6` | Fade-in seconds on load |
 | `shadow` | `1` | Drop shadow; `0` turns it off |
+| `bar` | `0` | `1` switches to a full-width bottom bar: brand left, clock right, on a background band |
+| `barh` | `54` | Bar height, in the 854×480 design grid's units |
+| `baropacity` | `1` | Background band opacity, `0`–`1` |
 | `tz` | `Australia/Sydney` | Clock timezone, any IANA name; `local` uses the machine's own |
 | `tzlabel` | *(none)* | Short label before the digits, e.g. `SYD` |
 | `secs` | `1` | `0` shows `HH:MM` instead of `HH:MM:SS` |

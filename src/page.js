@@ -68,6 +68,25 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
   .tagline { color:var(--muted); margin:0; font-size:.95rem; }
   h2 { font-size:1.1rem; margin:2.5rem 0 .9rem; padding-bottom:.4rem; border-bottom:1px solid var(--line); }
   h3 { font-size:.95rem; margin:1.5rem 0 .5rem; }
+
+  /* Collapsible reference sections. Setting up a stream is a short path;
+     the API and internals are looked up once and then never again, so they
+     start closed and stop burying the parts people actually act on. */
+  details.sec { margin:2.5rem 0 0; border-bottom:1px solid var(--line); }
+  details.sec > summary {
+    font-size:1.1rem; font-weight:600; cursor:pointer; list-style:none;
+    padding-bottom:.4rem; display:flex; align-items:center; gap:.5rem;
+  }
+  details.sec > summary::-webkit-details-marker { display:none; }
+  details.sec > summary::before {
+    content:"›"; display:inline-block; transition:transform .15s;
+    color:var(--muted); font-size:1.2rem; line-height:1;
+  }
+  details.sec[open] > summary::before { transform:rotate(90deg); }
+  details.sec > summary:hover { color:var(--accent); }
+  details.sec > summary .sub { font-weight:400; font-size:.8rem; color:var(--muted); }
+  details.sec > :not(summary) { margin-bottom:1rem; }
+  details.sec h3:first-of-type { margin-top:1rem; }
   p { margin:.6rem 0; }
   code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.875em;
          background:var(--code-bg); padding:.15em .4em; border-radius:4px; }
@@ -313,6 +332,8 @@ insists on the extension.</p>
   settings box, so setting it there alone has no effect.
 </div>
 
+<details class="sec" style="margin-top:1.5rem">
+<summary>Recommended settings and an ffmpeg test <span class="sub">— encoder profile, verify without OBS</span></summary>
 <h3>Recommended settings</h3>
 <ul class="small">
   <li><b>1280×720 @ 30 fps, 2500 Kbps.</b> VRChat screens are small; this looks fine
@@ -330,6 +351,8 @@ insists on the extension.</p>
 <p class="small muted">Then confirm a real HLS client can play it back:</p>
 <div class="snip"><pre><code id="cmd-verify"></code></pre></div>
 
+</details>
+
 <!-- ============ OVERLAY ============ -->
 <h2>Brand overlay</h2>
 <p class="small muted">
@@ -341,7 +364,10 @@ insists on the extension.</p>
 
 <table>
   <tr><th>Preset</th><th>URL</th></tr>
-  <tr><td>Brand, LIVE dot and a Sydney clock</td>
+  <tr><td><b>Bottom bar</b> — brand left, clock right, on a background band<br>
+          <span class="small muted">1280×720, aligns with the stream</span></td>
+      <td><div class="cfgval"><code id="ov-bar"></code><button class="minicopy" data-copy="ov-bar">Copy</button></div></td></tr>
+  <tr><td>Corner lockup with LIVE dot and a Sydney clock</td>
       <td><div class="cfgval"><code id="ov-full"></code><button class="minicopy" data-copy="ov-full">Copy</button></div></td></tr>
   <tr><td>Brand only, nothing moving but the sweep</td>
       <td><div class="cfgval"><code id="ov-plain"></code><button class="minicopy" data-copy="ov-plain">Copy</button></div></td></tr>
@@ -358,8 +384,15 @@ insists on the extension.</p>
       <td>Subtitle, letter-spaced to match the headline's width</td></tr>
   <tr><td><code>url</code></td><td><code>HTTPS://KRSZ.IN</code></td>
       <td>Opposite-corner credit; <code>url=</code> hides it</td></tr>
+  <tr><td><code>bar</code></td><td><code>0</code></td>
+      <td><code>1</code> switches to the full-width bottom bar</td></tr>
+  <tr><td><code>barh</code></td><td><code>54</code></td>
+      <td>Bar height, in the same units as the 854×480 design grid</td></tr>
+  <tr><td><code>baropacity</code></td><td><code>1</code></td>
+      <td>Background band opacity, <code>0</code>–<code>1</code></td></tr>
   <tr><td><code>pos</code></td><td><code>tl</code></td>
-      <td>Corner: <code>tl</code>, <code>tr</code>, <code>bl</code>, <code>br</code></td></tr>
+      <td>Corner for the lockup: <code>tl</code>, <code>tr</code>, <code>bl</code>, <code>br</code>
+          (ignored when <code>bar=1</code>)</td></tr>
   <tr><td><code>live</code></td><td><code>0</code></td><td><code>1</code> adds a pulsing LIVE dot</td></tr>
   <tr><td><code>clock</code></td><td><code>0</code></td><td><code>1</code> adds a running clock</td></tr>
   <tr><td><code>tz</code></td><td><code>Australia/Sydney</code></td>
@@ -378,7 +411,8 @@ insists on the extension.</p>
 </div>
 
 <!-- ============ API ============ -->
-<h2>API</h2>
+<details class="sec">
+<summary>API <span class="sub">— endpoints, status JSON, multiple streams</span></summary>
 
 <h3>Ingest — requires key</h3>
 <table>
@@ -447,8 +481,11 @@ limited to <code>[A-Za-z0-9._-]</code>, max 128 characters.</p>
 window. Push to <code>/ingest/&lt;KEY&gt;/room2/…</code> and play <code>/room2</code>
 — no configuration required.</p>
 
+</details>
+
 <!-- ============ ARCHITECTURE ============ -->
-<h2>How it works</h2>
+<details class="sec">
+<summary>How it works <span class="sub">— architecture and design notes</span></summary>
 <div class="grid2">
   <div class="kv"><div class="k">Segment</div><div class="v">${segDur}s</div></div>
   <div class="kv"><div class="k">Playlist window</div><div class="v">${playlistSize}</div></div>
@@ -492,6 +529,8 @@ window. Push to <code>/ingest/&lt;KEY&gt;/room2/…</code> and play <code>/room2
   playback stopping at the end of the window and not resuming. On Windows,
   leave it off.
 </div>
+
+</details>
 
 <footer>KRSZ Live ·
   <a href="/healthz">health</a></footer>
@@ -588,6 +627,7 @@ function render() {
   setText('f-gop', String(30 * SEG_DUR));
   setText('qs-gop', String(30 * SEG_DUR));
 
+  setText('ov-bar', overlayUrl({ bar: 1, live: 1, clock: 1, tzlabel: 'SYD' }));
   setText('ov-full', overlayUrl({ live: 1, clock: 1, tzlabel: 'SYD' }));
   setText('ov-plain', overlayUrl({}));
   setText('ov-tr', overlayUrl({ pos: 'tr', live: 1, clock: 1, tzlabel: 'SYD' }));
