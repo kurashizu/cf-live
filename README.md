@@ -334,12 +334,38 @@ regenerated slate is a new URL and reaches viewers immediately despite being
 served `immutable` for a year. The unversioned path still works for old
 clients but is deliberately short-lived.
 The animation is a ping-pong sweep driven by a cosine, so velocity is zero at
-both ends of the 2s segment and the loop point is continuous in both position
+both ends of the segment and the loop point is continuous in both position
 and motion — no visible jerk each time a player repeats it. Frames are drawn by
 a pure-Python PNG writer with a 5x7 bitmap font, so generation needs no fonts,
-no Pillow, and no ffmpeg `drawtext` (absent from many builds). Viewers see why there is no picture, and
-because the slate is identical on every request it can be cached at the edge —
-which is what keeps idle viewers from draining the request quota.
+no Pillow, and no ffmpeg `drawtext` (absent from many builds).
+
+The segment is 32 frames at 15 fps: 2.1333 s, which is exactly 100 AAC frames
+at 48 kHz. No whole number of AAC frames adds up to 2.000 s, so a 2 s slate
+carried a 26.7 ms audio surplus that accumulated on every repeat until the
+audio clock outran the video and the picture froze with the buffer full. The
+two tracks are now the same length to the sample.
+
+It is one file, but it is served as an endless live stream. Each playlist
+slot points at `_offline.<hash>.<n>.ts`: the same media with every PTS, DTS
+and PCR advanced by n × 2.1333 s, rewritten at the byte level with nothing
+re-encoded. Consecutive slots therefore form one continuous timeline, and the
+only `EXT-X-DISCONTINUITY` markers left are real seams — slate to live, live
+to slate, an encoder restart — each counted by `EXT-X-DISCONTINUITY-SEQUENCE`
+as it scrolls out of the window. Repeating the bytes verbatim needed a
+discontinuity on every slot, and each one was a decoder reset with a chance
+of a buffer hole. Position n is a pure function of the slate and n, so it is
+still served `immutable` and still cached at the edge, which is what keeps
+idle viewers from draining the request quota.
+
+On the VPS the slate timeline advances on the wall clock, never on the polls
+that happen to arrive, and it runs one entry ahead of the clock. The first
+version appended an entry per poll once the previous had "played out", so
+every poll's latency slipped the timeline a little further behind real time
+and the player, playing at real time, drained its buffer and stalled once per
+fragment. When a broadcast stops the slate takes over within about a second
+(`--stale-after`), with two entries published at once so a viewer sitting a
+second behind the live edge has something to play before their buffer runs
+dry.
 
 An empty playlist cost ~0.67 req/s per idle viewer indefinitely: three tabs
 left open would exhaust a day's free tier showing nothing. The slate playlist

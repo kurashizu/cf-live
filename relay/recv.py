@@ -21,6 +21,7 @@ waiting for it would stall the stream.
 
 import argparse
 import collections
+import math
 import os
 import socket
 import struct
@@ -313,10 +314,14 @@ def available_playlist(body, have, window=0):
     kept = [e for e in entries if e[2] in have]
     if not kept:
         return None
-    # A player begins at the oldest advertised fragment, so window depth is
-    # the dominant latency term. Keep only the newest few.
-    if window > 0 and len(kept) > window:
-        kept = kept[-window:]
+    # The window is the origin's, not trimmed here. The origin already
+    # advertises only a few entries, and when it advertises more it is on
+    # purpose: across a slate -> live seam it holds the slate entries a few
+    # seconds so a player still polling at the slate cadence finds an entry
+    # it knows in every playlist. Cutting that back to the newest few
+    # reintroduced the failure on this side: two consecutive polls with no
+    # entry in common, and the player guessing the gap with the wrong
+    # segment length. `window` is accepted for compatibility and ignored.
     # The sequence must match the first fragment actually published, whether
     # it was dropped for being unrecovered or for being outside the window.
     first_uri = kept[0][2]
@@ -327,16 +332,28 @@ def available_playlist(body, have, window=0):
         dropped_front += 1
 
     published = monotonic_seq(seq + dropped_front)
+    # Every discontinuity tag dropped from the front is one more timeline
+    # that has scrolled out of view, and EXT-X-DISCONTINUITY-SEQUENCE has to
+    # say so (RFC 8216 6.2.2) or the player numbers the remaining timelines
+    # one too low and applies a stale timestamp offset to the wrong media.
+    dropped_discs = sum(1 for disc, _inf, _uri in entries[:dropped_front] if disc)
     out = []
     for line in header:
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
             out.append("#EXT-X-MEDIA-SEQUENCE:%d" % published)
+        elif line.startswith("#EXT-X-DISCONTINUITY-SEQUENCE:"):
+            try:
+                base = int(line.split(":", 1)[1])
+            except ValueError:
+                base = 0
+            out.append("#EXT-X-DISCONTINUITY-SEQUENCE:%d" % (base + dropped_discs))
         elif line.startswith("#EXT-X-TARGETDURATION:"):
             # ffmpeg rounds to an integer and writes 0 for sub-second
             # segments. RFC 8216 requires a positive integer that is at
             # least the longest EXTINF, and a 0 makes players reject the
-            # playlist outright.
-            out.append("#EXT-X-TARGETDURATION:%d" % max(1, int(round(longest))))
+            # playlist outright. Rounded up, not to nearest: 2.133 s
+            # entries need a 3, and round() would say 2.
+            out.append("#EXT-X-TARGETDURATION:%d" % max(1, int(math.ceil(longest))))
         else:
             out.append(line)
     for disc, inf, uri in kept:

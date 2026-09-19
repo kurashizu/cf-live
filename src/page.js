@@ -639,6 +639,35 @@ function load() {
   startStatus(name);
 }
 
+/* ---------- latency catch-up ---------- */
+// After a seam (slate <-> live) or a stall, hls.js leaves playback wherever it
+// landed, often seconds further behind the edge than the sync target, and
+// nothing pulls it back: its own rate control only runs in lowLatencyMode.
+// So play slightly fast until within reach of the target. 1.2x is
+// unobtrusive on live video and recovers two seconds in ten. The target is
+// hls.js's own, which already grows after real stalls, so this never chases
+// a latency the player has decided it needs.
+const CATCH_UP_RATE = 1.2;
+function catchUp() {
+  const v = document.getElementById('video');
+  if (!hls) { if (v.playbackRate !== 1) v.playbackRate = 1; return; }
+  const lat = hls.latency, target = hls.targetLatency;
+  if (!Number.isFinite(lat) || !Number.isFinite(target)) return;
+  let ahead = 0;
+  for (let i = 0; i < v.buffered.length; i++) {
+    if (v.buffered.start(i) <= v.currentTime && v.currentTime <= v.buffered.end(i)) {
+      ahead = v.buffered.end(i) - v.currentTime;
+    }
+  }
+  // Hysteresis: engage a full second past target, release close to it, and
+  // never speed into an empty buffer.
+  let want = v.playbackRate;
+  if (lat > target + 1.0 && ahead > 1.0) want = CATCH_UP_RATE;
+  else if (lat < target + 0.3 || ahead < 0.5) want = 1;
+  if (want !== v.playbackRate) v.playbackRate = want;
+}
+document.getElementById('video').addEventListener('timeupdate', catchUp);
+
 /**
  * Seek to the furthest playable position without rebuilding the player.
  *

@@ -12,8 +12,13 @@ import struct, zlib, sys, os, math
 
 W, H = 854, 480
 FPS = 15
-SECONDS = 2
-FRAMES = FPS * SECONDS
+# 32 frames at 15 fps is 2.1333 s, which is exactly 100 AAC frames at 48 kHz
+# (1024 samples each). No whole number of AAC frames adds up to 2.000 s, so
+# a 2 s slate always carried a 26.7 ms audio surplus; looping one fixed file
+# accumulated it until the audio clock outran the available video and the
+# picture froze with the buffer still full.
+FRAMES = 32
+SECONDS = FRAMES / FPS
 
 BG = (10, 11, 14)
 FG = (150, 154, 163)

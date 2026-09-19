@@ -219,7 +219,7 @@ note "sequence across restart: $seq_pre → $seq_post"
 # the filename, so a restart can move it backwards — legal only if the player
 # is told the timeline broke, otherwise it stalls.
 if [ -n "$seq_post" ] && [ "$seq_post" -lt "${seq_pre:-0}" ] 2>/dev/null; then
-  if grep -q 'EXT-X-DISCONTINUITY' "$TMP/disc.m3u8" 2>/dev/null; then
+  if grep -qx '#EXT-X-DISCONTINUITY' "$TMP/disc.m3u8" 2>/dev/null; then
     ok "sequence went backwards but discontinuity is signalled"
   else
     wrn "sequence went backwards ($seq_pre → $seq_post) with no DISCONTINUITY"

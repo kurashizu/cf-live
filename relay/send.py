@@ -213,7 +213,6 @@ def main():
                      daemon=True).start()
 
     d = Path(args.root) / args.stream
-    slate_dir = Path(args.root) / "offline"
     # The continuous playlist is generated per request, not stored: when
     # nobody is broadcasting there is no live.m3u8 on disk at all. Reading
     # the file would therefore relay nothing during exactly the period the
@@ -229,6 +228,7 @@ def main():
     next_seq = 0
     gen = 0
     last_pl = b""
+    seg_secs = 1.0
 
     while True:
         peers = live_peers(args.peer_ttl)
@@ -251,24 +251,50 @@ def main():
 
         names = [l.strip() for l in body.decode("utf-8", "replace").splitlines()
                  if l.strip() and not l.startswith("#")]
-        for name in names:
-            if name in sent_names:
-                continue
+        # Segment duration, read from the playlist rather than configured:
+        # it has to match whatever the encoder is actually producing.
+        for line in body.decode("utf-8", "replace").splitlines():
+            if line.startswith("#EXTINF:"):
+                try:
+                    seg_secs = float(line.split(":", 1)[1].split(",")[0])
+                    break
+                except ValueError:
+                    pass
+        pending = [n for n in names if n not in sent_names]
+        for name in pending:
             # A slate entry is root-absolute and shared by every idle stream;
             # a live one is relative to this stream's directory. Both must be
             # relayed, or a viewer loses the picture whenever ingest pauses.
+            # The slate is fetched from the origin rather than read from
+            # disk: each position is the one slate file with its timestamps
+            # advanced to that point in the timeline, and only the origin
+            # produces those. The raw file would rewind PTS every fragment.
             if name.startswith("/"):
-                path = slate_dir / "offline.ts"
+                try:
+                    req = urllib.request.Request(args.origin.rstrip("/") + name)
+                    req.add_header("User-Agent", "krsz-send/1")
+                    f = urllib.request.urlopen(req, timeout=5)
+                    try:
+                        data = f.read()
+                    finally:
+                        f.close()
+                except Exception:
+                    STATS["slate_error"] += 1
+                    continue
             else:
-                path = d / name
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
+                try:
+                    data = (d / name).read_bytes()
+                except OSError:
+                    continue
             if not data:
                 continue
+            # Spread this segment's shards over the time before the next
+            # one is due, minus a margin. Smoothing the burst still avoids
+            # queue drops, but never at the cost of falling behind.
+            budget = max(0.0, seg_secs * 0.6)
+            pace = min(args.pace, budget / max(len(pending), 1))
             send_segment(sock, peers, args.stream_id, next_seq, data,
-                         args.k, args.n, codec, args.pace)
+                         args.k, args.n, codec, pace)
             sent_names[name] = "seg%05d.ts" % (next_seq % 100000)
             next_seq += 1
             while len(sent_names) > 60:
@@ -279,7 +305,10 @@ def main():
             gen += 1
             send_manifest(sock, peers, args.stream_id, gen, new_pl)
             last_pl = new_pl
-        time.sleep(0.3)
+        # Poll well inside the segment interval. Sleeping a fixed 0.3 s
+        # added to the pacing time and pushed the loop past the rate at
+        # which segments appear.
+        time.sleep(min(0.15, seg_secs / 4.0))
 
 
 if __name__ == "__main__":

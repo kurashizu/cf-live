@@ -16,7 +16,7 @@
  */
 
 import { landingPage } from './page.js';
-import { slateBytes, SLATE_DURATION, SLATE_VERSION } from './slate.js';
+import { slateBytes, shiftTimestamps, SLATE_DURATION, SLATE_VERSION } from './slate.js';
 
 /**
  * Paths that can never be a stream name, because the short alias route
@@ -102,14 +102,18 @@ export default {
       // The offline slate. Served straight from the Worker with a long cache
       // lifetime — it never changes, so it must never reach a Durable Object.
       // This is what makes an idle viewer free after the first request.
-      // /live/_offline.<version>.<sequence>.ts — the sequence only makes the
-      // URL unique per playlist slot; every one serves the same bytes.
-      const slate = path.match(/^\/live\/_offline(?:\.([0-9a-f]{8}))?(?:\.\d+)?\.ts$/);
+      // /live/_offline.<version>.<position>.ts — one file, but position n
+      // carries timestamps advanced by n x duration so consecutive slots
+      // form a continuous stream. The bytes are a pure function of
+      // (version, position), which is what makes them safe to cache.
+      const slate = path.match(/^\/live\/_offline(?:\.([0-9a-f]{8}))?(?:\.(\d+))?\.ts$/);
       if (slate) {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return text('method not allowed', 405);
         }
-        const bytes = slateBytes();
+        const bytes = slate[2] === undefined
+          ? slateBytes()
+          : shiftTimestamps(slateBytes(), Number(slate[2]) * SLATE_DURATION);
         // Only the versioned URL may be cached long-term. An unversioned
         // request is either an old client or a stale playlist, and caching
         // that for a year is what pinned viewers to an outdated slate.
@@ -572,18 +576,19 @@ export class LiveRoom {
         `#EXT-X-MEDIA-SEQUENCE:${seq}`,
       ];
       for (let i = 0; i < count; i++) {
-        // Every slot is the same file, so its media restarts at PTS 0 while
-        // the playlist advances. Without this marker a player places the
-        // fragment at i x duration, finds timestamps that rewind, treats it
-        // as already buffered, and stops advancing — the slate freezes after
-        // one fragment with no error reported.
-        lines.push('#EXT-X-DISCONTINUITY');
+        // Slot n is served with its timestamps advanced by n x duration, so
+        // consecutive slots are one continuous stream and need no
+        // discontinuity between them. The one exception is the sequence
+        // wrap, where the position — and with it the timestamps — rewinds.
+        if (i > 0 && (seq + i) % OFFLINE_SEQUENCE_MODULUS === 0) {
+          lines.push('#EXT-X-DISCONTINUITY');
+        }
         lines.push(`#EXTINF:${SLATE_DURATION.toFixed(3)}, no desc`);
         // Distinct URL per slot: players dedupe by URI, and repeating one
         // would be read as the same segment already played rather than the
         // next one in the timeline.
         // Relative to /live/<stream>/index.m3u8, so ../ lands in /live/.
-        lines.push(`../_offline.${SLATE_VERSION}.${seq + i}.ts`);
+        lines.push(`../_offline.${SLATE_VERSION}.${(seq + i) % OFFLINE_SEQUENCE_MODULUS}.ts`);
       }
       lines.push('');
       return new Response(lines.join('\n'), {
@@ -808,12 +813,14 @@ function windowDuration(files, durations, fallback) {
  * it as a new stream, which is the correct outcome for a feed nobody is
  * watching.
  */
+// Wrapped small on purpose. The sequence still has to advance once per slate
+// length so the playlist reads as live, but AVPro renders a stream whose
+// media sequence is in the hundreds of thousands as black video, so the
+// modulus is kept to four digits.
+const OFFLINE_SEQUENCE_MODULUS = 10_000;
+
 function offlineSequence() {
-  // Wrapped small on purpose. It still has to advance once per slate length
-  // so the playlist reads as live, but AVPro renders a stream whose media
-  // sequence is in the hundreds of thousands as black video, so the modulus
-  // is kept to four digits.
-  return Math.floor(Date.now() / 1000 / SLATE_DURATION) % 10_000;
+  return Math.floor(Date.now() / 1000 / SLATE_DURATION) % OFFLINE_SEQUENCE_MODULUS;
 }
 
 /** Extract ffmpeg's numeric counter from a segment filename, e.g. seg00042.ts -> 42. */

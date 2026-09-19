@@ -6,7 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 python3 - <<'PY'
-import importlib.util
+import importlib.util, pathlib, shutil
 spec = importlib.util.spec_from_file_location("cl", "vps/cf-live.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.CONFIG.update({"window": 3, "slate_version": "deadbeef",
@@ -15,7 +15,6 @@ m.CONFIG.update({"window": 3, "slate_version": "deadbeef",
 class H:
     trim_window = m.Handler.trim_window
     monotonic_sequence = m.Handler.monotonic_sequence
-    offline_playlist = m.Handler.offline_playlist
 h = H()
 
 def playlist(seq, n, start):
@@ -92,17 +91,149 @@ done = playlist(0, 6, 0).decode() + "#EXT-X-ENDLIST\n"
 check(h.trim_window(done.encode(), "s") == done.encode(),
       "ENDLIST playlist passes through untouched")
 
-print("── the slate playlist references the fingerprinted path")
-sl = h.offline_playlist()
-check("/live/_offline.deadbeef." in sl, "slate URI carries the fingerprint")
-# Each slot needs its own URI and its own discontinuity: the slate is one
-# file, so repeating a URI reads as the same fragment already played, and
-# even with distinct URIs the repeated PTS reads as already buffered.
-uris = [l for l in sl.splitlines() if l.startswith("/live/")]
-check(len(set(uris)) == len(uris), "slate slots have distinct URIs")
-check(sl.count("#EXT-X-DISCONTINUITY") == len(uris),
-      "every slate slot is preceded by a discontinuity")
-check("#EXT-X-ENDLIST" not in sl, "slate playlist never ends")
+print("── idle slate advances on the wall clock, not on polls")
+# The continuous playlist is what viewers actually receive. Drive it with a
+# fake clock and irregular polls: the number of slate entries must depend
+# only on elapsed time, or a slow poller's timeline slips behind real time
+# and its player drains and stalls once per fragment.
+import time as _time
+class C(H):
+    continuous_playlist = m.Handler.continuous_playlist
+    slate_uri = m.Handler.slate_uri
+    def __init__(self): self.fresh = []
+    def live_segments(self, stream): return list(self.fresh)
+c = C()
+clock = [1000.0]
+_real = _time.time
+_time.time = lambda: clock[0]
+try:
+    dur = m.CONFIG["slate_duration"]
+    m.SEQ_STATE.clear()
+    def entries(body):
+        return [l for l in body.decode().splitlines() if l and not l.startswith("#")]
+    first = c.continuous_playlist("s")
+    check(len(entries(first)) >= 3, "a new idle stream starts with a full window")
+    hold = dur * 2 + 1.0
+    def discs(body):
+        return sum(1 for l in body.splitlines() if l == "#EXT-X-DISCONTINUITY")
+    check(discs(first.decode()) == 0,
+          "no discontinuity inside a pure slate timeline")
+    # Poll at awkward moments: late, then in a burst, then not at all.
+    seen = list(entries(first))
+    for dt in (0.9 * dur, 2.5 * dur, 0.1, 0.1, 0.1, 3.0 * dur):
+        clock[0] += dt
+        for u in entries(c.continuous_playlist("s")):
+            if u not in seen: seen.append(u)
+    elapsed = clock[0] - 1000.0
+    expected = len(entries(first)) + int(elapsed / dur)
+    check(len(seen) == expected,
+          f"{elapsed/dur:.1f} durations elapsed -> {expected} entries (got {len(seen)})")
+    pos = [int(u.rsplit(".", 2)[1]) for u in seen]
+    check(pos == list(range(pos[0], pos[0] + len(pos))),
+          f"positions climb by one and never repeat: {pos[:6]}...")
+    check(all("/live/_offline.deadbeef." in u for u in seen),
+          "slate URIs carry the fingerprint")
+
+    print("── a long unpolled idle skips ahead instead of replaying the gap")
+    clock[0] += 600
+    body = c.continuous_playlist("s").decode()
+    tail = seq_of(body)
+    check(tail < 3 + 600 / dur, f"sequence did not replay ten minutes of slate (seq {tail})")
+
+    def discs_of(body):
+        return sum(1 for l in body.splitlines() if l == "#EXT-X-DISCONTINUITY")
+    print("── live -> slate is exactly one seam")
+    m.SEQ_STATE.clear()
+    c.fresh = [("seg00000.ts", 0.5), ("seg00001.ts", 0.5)]
+    c.continuous_playlist("s")
+    clock[0] += hold   # let the opening slate entries age out of the window
+    c.fresh = [("seg00000.ts", 0.5), ("seg00001.ts", 0.5), ("seg00002.ts", 0.5)]
+    c.continuous_playlist("s")
+    c.fresh = []
+    discs = 0
+    for _ in range(4):
+        clock[0] += dur
+        discs += discs_of(c.continuous_playlist("s").decode())
+    check(discs >= 1, "the first slate entry after live carries a discontinuity")
+    body = c.continuous_playlist("s").decode()
+    check(discs_of(body) <= 1, "later slate entries carry none")
+    print("── DISCONTINUITY-SEQUENCE counts the tags that scrolled away")
+    def dseq(body):
+        for l in body.splitlines():
+            if l.startswith("#EXT-X-DISCONTINUITY-SEQUENCE:"):
+                return int(l.split(":")[1])
+    m.SEQ_STATE.clear()
+    c.continuous_playlist("s")
+    clock[0] += hold
+    c.fresh = [("seg00000.ts", 0.5), ("seg00001.ts", 0.5), ("seg00002.ts", 0.5)]
+    c.continuous_playlist("s")
+    c.fresh = []
+    clock[0] += dur
+    body = c.continuous_playlist("s").decode()
+    at_seam = dseq(body)
+    check(discs_of(body) == 1, "the seam tag is in the window")
+    for _ in range(4):
+        clock[0] += dur
+        body = c.continuous_playlist("s").decode()
+    check(discs_of(body) == 0 and dseq(body) == at_seam + 1,
+          f"tag scrolled out, sequence rose by one ({at_seam} -> {dseq(body)})")
+
+    print("── slate entries are held across the slate -> live seam")
+    # A player still polling at the slate cadence must find an entry it
+    # already knows in every playlist, or it misplaces the live timeline.
+    m.SEQ_STATE.clear()
+    c.fresh = []
+    c.continuous_playlist("s")
+    clock[0] += hold + dur
+    before = entries(c.continuous_playlist("s"))
+    segs = []
+    for i in range(6):
+        segs.append(("seg%05d.ts" % i, 0.5))
+        c.fresh = list(segs[-6:])
+        clock[0] += 0.5
+        now_entries = entries(c.continuous_playlist("s"))
+        check(set(before) & set(now_entries),
+              f"+{(i+1)*0.5:.1f}s: overlaps the pre-seam window ({len(now_entries)} entries)")
+    clock[0] += hold
+    c.fresh = list(segs[-6:])
+    now_entries = entries(c.continuous_playlist("s"))
+    check(len(now_entries) == 3 and not any("_offline" in e for e in now_entries),
+          "after the hold the window is back to three live entries")
+    print("── an encoder restart while live is a seam")
+    c.fresh = [("seg00000.ts", 0.5)]
+    body = c.continuous_playlist("s").decode().splitlines()
+    i = body.index("#EXT-X-DISCONTINUITY") if "#EXT-X-DISCONTINUITY" in body else -1
+    check(i >= 0 and body[i + 2] == "seg00000.ts",
+          f"renumbered segments start with a discontinuity: {body[i:i+3]}")
+
+    print("── slate -> live is exactly one seam")
+    c.fresh = []
+    for _ in range(5):
+        clock[0] += dur
+        c.continuous_playlist("s")
+    c.fresh = [("seg00000.ts", 0.5)]
+    body = c.continuous_playlist("s").decode().splitlines()
+    i = body.index("#EXT-X-DISCONTINUITY") if "#EXT-X-DISCONTINUITY" in body else -1
+    check(i >= 0 and body[i + 2] == "seg00000.ts",
+          f"discontinuity sits on the first live segment: {body[i:i+3]}")
+finally:
+    _time.time = _real
+
+print("── shifted slate timestamps move by exactly the position offset")
+raw = pathlib.Path("vps/offline.ts").read_bytes()
+import subprocess, json
+def starts(data):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                        "stream=start_time", "-of", "json", "-"],
+                       input=data, capture_output=True)
+    return [float(x["start_time"]) for x in json.loads(r.stdout)["streams"]]
+if shutil.which("ffprobe"):
+    s0, s7 = starts(raw), starts(m.shift_timestamps(raw, 7 * dur))
+    check(all(abs((b - a) - 7 * dur) < 0.001 for a, b in zip(s0, s7)),
+          f"every track advanced by 7 x {dur:.4f}s: {s0} -> {s7}")
+    check(len(m.shift_timestamps(raw, 1.0)) == len(raw), "length unchanged")
+else:
+    print("  SKIP  ffprobe not installed")
 
 print()
 if fails:

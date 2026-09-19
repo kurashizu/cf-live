@@ -15,16 +15,34 @@ trap 'rm -rf "$TMP"' EXIT
 
 python3 scripts/slate.py "$TMP/frames"
 
+# The slate is 32 frames at 15 fps: 2.1333 s, which is exactly 100 AAC
+# frames at 48 kHz. No whole number of AAC frames adds up to 2.000 s, so a
+# 2 s slate carried a 26.7 ms audio surplus; served as a loop, that surplus
+# accumulated until the audio clock outran the video and the picture froze
+# with the buffer full. The two tracks must be the same length to the sample.
+#
+# The AAC encoder pads a final frame, so the audio is encoded on its own and
+# cut to exactly 100 packets before muxing; -t would leave 101.
+ffmpeg -hide_banner -loglevel error -y \
+  -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
+  -t 2.1333333 -c:a aac -b:a 16k "$TMP/audio.aac"
+ffmpeg -hide_banner -loglevel error -y \
+  -i "$TMP/audio.aac" -c copy -frames:a 100 "$TMP/audio100.aac"
+
 # The frame sequence is a ping-pong sweep, so the segment loops seamlessly
-# when a player repeats it. -g 30 puts a keyframe on every loop boundary.
+# when a player repeats it. -g 32 puts a keyframe on every loop boundary.
 ffmpeg -hide_banner -loglevel error -y \
   -framerate 15 -i "$TMP/frames/f%04d.png" \
-  -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
-  -t 2 \
+  -i "$TMP/audio100.aac" \
   -c:v libx264 -preset veryslow -profile:v main -level 3.1 -bf 0 \
-  -g 30 -keyint_min 30 -sc_threshold 0 -pix_fmt yuv420p -crf 30 \
-  -c:a aac -b:a 16k -ar 48000 -ac 2 \
+  -g 32 -keyint_min 32 -sc_threshold 0 -pix_fmt yuv420p -crf 30 \
+  -c:a copy -frames:v 32 \
   -muxdelay 0 -muxpreload 0 -f mpegts "$TMP/offline.ts"
+
+# Both tracks must agree exactly, or the drift described above returns.
+ffprobe -v error -count_packets \
+  -show_entries stream=codec_type,nb_read_packets,duration -of csv=p=0 \
+  "$TMP/offline.ts" | sort -u
 
 python3 - "$TMP/offline.ts" <<'PY'
 import base64, io, sys, hashlib
@@ -54,7 +72,8 @@ out = f'''/**
 const SLATE_B64 =
   {body};
 
-export const SLATE_DURATION = 2.0;
+// 32 frames at 15 fps, and exactly 100 AAC frames: see make-slate.sh.
+export const SLATE_DURATION = 32 / 15;
 
 /**
  * Content fingerprint, embedded in the slate's URL.
@@ -77,6 +96,82 @@ export function slateBytes() {{
   for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
   cached = buf;
   return cached;
+}}
+
+// --- timestamps -------------------------------------------------------------
+//
+// The slate is one short file served as an endless live stream. Repeating
+// the bytes verbatim repeats the timestamps too: every fragment restarts at
+// PTS 0 while the playlist says time moved on, which a player can only
+// reconcile with a discontinuity per fragment -- a decoder reset and a
+// potential buffer hole every two seconds. Serving position n with every
+// timestamp advanced by n x duration makes the slate a genuinely continuous
+// stream instead. It is a byte-level rewrite of the MPEG-TS headers; the
+// payload is untouched and nothing is re-encoded.
+
+const TS_PACKET = 188;
+const TS_SYNC = 0x47;
+const TS_CLOCK = 90000;
+const TS_WRAP = 2 ** 33;   // 33-bit timestamps roll over; players expect it
+
+// 33-bit values exceed JavaScript's 32-bit bitwise range, so the wide parts
+// are assembled with arithmetic rather than shifts.
+function readTs(b, i) {{
+  return ((b[i] >> 1) & 0x07) * 2 ** 30 +
+    b[i + 1] * 2 ** 22 +
+    ((b[i + 2] >> 1) & 0x7f) * 2 ** 15 +
+    b[i + 3] * 2 ** 7 +
+    ((b[i + 4] >> 1) & 0x7f);
+}}
+
+function writeTs(b, i, value, prefix) {{
+  value = ((value % TS_WRAP) + TS_WRAP) % TS_WRAP;
+  b[i] = (prefix << 4) | ((Math.floor(value / 2 ** 30) & 0x07) << 1) | 1;
+  b[i + 1] = Math.floor(value / 2 ** 22) & 0xff;
+  b[i + 2] = ((Math.floor(value / 2 ** 15) & 0x7f) << 1) | 1;
+  b[i + 3] = Math.floor(value / 2 ** 7) & 0xff;
+  b[i + 4] = ((value & 0x7f) << 1) | 1;
+}}
+
+/** A copy of an MPEG-TS segment with every PTS, DTS and PCR moved forward. */
+export function shiftTimestamps(data, seconds) {{
+  const delta = Math.round(seconds * TS_CLOCK);
+  const out = new Uint8Array(data);
+  for (let base = 0; base + TS_PACKET <= out.length; base += TS_PACKET) {{
+    if (out[base] !== TS_SYNC) continue;
+    const afc = (out[base + 3] >> 4) & 0x03;
+    let pos = base + 4;
+    if (afc === 2 || afc === 3) {{
+      const afLen = out[pos];
+      if (afLen && (out[pos + 1] & 0x10) && afLen >= 7) {{   // PCR
+        const q = pos + 2;
+        let pcr = out[q] * 2 ** 25 + out[q + 1] * 2 ** 17 +
+          out[q + 2] * 2 ** 9 + out[q + 3] * 2 + (out[q + 4] >> 7);
+        const ext = ((out[q + 4] & 0x01) << 8) | out[q + 5];
+        pcr = (pcr + delta) % TS_WRAP;
+        out[q] = Math.floor(pcr / 2 ** 25) & 0xff;
+        out[q + 1] = Math.floor(pcr / 2 ** 17) & 0xff;
+        out[q + 2] = Math.floor(pcr / 2 ** 9) & 0xff;
+        out[q + 3] = Math.floor(pcr / 2) & 0xff;
+        out[q + 4] = ((pcr & 0x01) << 7) | 0x7e | (ext >> 8);
+        out[q + 5] = ext & 0xff;
+      }}
+      pos += 1 + afLen;
+    }}
+    if (afc === 0 || afc === 2) continue;             // no payload
+    if (!(out[base + 1] & 0x40)) continue;            // not a PES start
+    if (pos + 9 > base + TS_PACKET) continue;
+    if (out[pos] !== 0 || out[pos + 1] !== 0 || out[pos + 2] !== 1) continue;
+    const flags = out[pos + 7];
+    const opt = pos + 9;
+    if (flags & 0x80 && opt + 5 <= base + TS_PACKET) {{                  // PTS
+      writeTs(out, opt, readTs(out, opt) + delta, flags & 0x40 ? 0x3 : 0x2);
+      if (flags & 0x40 && opt + 10 <= base + TS_PACKET) {{               // DTS
+        writeTs(out, opt + 5, readTs(out, opt + 5) + delta, 0x1);
+      }}
+    }}
+  }}
+  return out;
 }}
 '''
 io.open('src/slate.js', 'w', encoding='utf-8').write(out)

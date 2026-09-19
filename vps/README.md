@@ -40,10 +40,12 @@ What carries over is what was hard to get right:
 - **Cache headers** — `.ts` immutable, playlists `no-store`. Plain `no-store`
   specifically: `no-cache, must-revalidate` gets stripped in transit, leaving
   no directive at all, at which point a browser caches anyway.
-- **The offline slate** — animated, correct codecs, seamless loop, served as a
-  rolling playlist so players keep polling and notice the broadcast starting.
-  Its URL carries a fingerprint of its own bytes
-  (`/live/_offline.<sha256[:8]>.ts`), computed at startup. Only the matching
+- **The offline slate** — animated, correct codecs, seamless loop, served as
+  one continuous timeline so players keep polling and notice the broadcast
+  starting. Each slot is `/live/_offline.<sha256[:8]>.<n>.ts`: the slate with
+  its timestamps advanced to position n, so no discontinuity is needed
+  between slots; only real seams (slate ↔ live, encoder restart) carry one.
+  The fingerprint is computed from the file at startup. Only the matching
   fingerprint gets the year-long immutable TTL; the bare path and any stale
   fingerprint get 60s. Without this a regenerated slate stays pinned in caches
   for up to a year — which happened, and was not obvious from the server side.

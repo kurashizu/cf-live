@@ -16,6 +16,7 @@ then deleted. Disk would only add wear.
 
 import argparse
 import hashlib
+import math
 import hmac
 import os
 import re
@@ -66,18 +67,129 @@ CONFIG = {}
 # only at a real seam (slate -> live, live -> slate, encoder restart).
 #
 #   {"seq": int,            # media sequence of window[0]
-#    "window": [(uri, dur, disc)],
+#    "window": [(uri, dur, disc, published)],
 #    "live": bool,          # was the last appended entry live content
 #    "last_raw": str,       # newest ffmpeg segment already appended
-#    "next_slate": float}   # when the next slate entry is due
+#    "next_slate": float,   # wall-clock time the next slate entry is due
+#    "slate_pos": int,      # timeline position of the next slate entry
+#    "disc_seq": int}       # discontinuities that have scrolled out of view
+#
+# Slate entries are scheduled against the wall clock, never against the
+# polls that happen to arrive. The first version appended one entry per poll
+# once the previous had "played out", which let every poll's network latency
+# slip the timeline a little further behind real time. The player, playing
+# at real time, drained its buffer and stalled once per fragment — the
+# stutter that looked like a broken slate file and was not.
 SEQ_STATE = {}
 SEQ_LOCK = threading.Lock()
 
-# How many distinct slate URIs to rotate through. Must comfortably exceed the
-# playlist window so no two entries in one window ever share a URI — a player
-# keys fragments by URI and would treat a repeat as one fragment, which is the
-# bug that made the slate play once and stall.
-SLATE_POSITIONS = 64
+# ---- slate timestamps -------------------------------------------------------
+#
+# The slate is one short file, but it is served as an endless live stream.
+# Repeating the same bytes would repeat the same timestamps: every fragment
+# would restart at PTS 0 while the playlist claims time keeps moving. A
+# player can only reconcile that with a discontinuity per fragment, and each
+# one is a seam where decoders reset and buffers can develop holes.
+#
+# So the slate is served per position instead: /live/_offline.<ver>.<n>.ts
+# carries the same media with every timestamp advanced by n x duration. The
+# result is a genuinely continuous stream, no different from a live one, and
+# the only discontinuities left are the real seams (slate <-> live, encoder
+# restart). Shifting is a byte-level rewrite of the MPEG-TS headers, no
+# re-encoding, and cheap enough to do per request; a small cache covers the
+# window every viewer is polling anyway.
+
+TS_PACKET = 188
+TS_SYNC = 0x47
+TS_CLOCK = 90000       # PTS/DTS/PCR ticks per second
+TS_WRAP = 1 << 33      # timestamps are 33-bit; they roll over, players expect it
+
+
+def _ts_read(buf, i):
+    """Decode the 33-bit timestamp at buf[i:i+5] (marker bits interleaved)."""
+    return (((buf[i] >> 1) & 0x07) << 30 |
+            buf[i + 1] << 22 |
+            ((buf[i + 2] >> 1) & 0x7F) << 15 |
+            buf[i + 3] << 7 |
+            (buf[i + 4] >> 1) & 0x7F)
+
+
+def _ts_write(buf, i, value, prefix):
+    value %= TS_WRAP
+    buf[i] = (prefix << 4) | ((value >> 30) & 0x07) << 1 | 1
+    buf[i + 1] = (value >> 22) & 0xFF
+    buf[i + 2] = ((value >> 15) & 0x7F) << 1 | 1
+    buf[i + 3] = (value >> 7) & 0xFF
+    buf[i + 4] = (value & 0x7F) << 1 | 1
+
+
+def shift_timestamps(data: bytes, seconds: float) -> bytes:
+    """Copy of an MPEG-TS segment with every PTS, DTS and PCR moved forward.
+
+    Touches only the fields that carry time: the PCR in adaptation fields
+    and the PTS/DTS in PES headers. Everything else, including continuity
+    counters and the payload, is passed through untouched.
+    """
+    delta = int(round(seconds * TS_CLOCK))
+    out = bytearray(data)
+    for base in range(0, len(out) - TS_PACKET + 1, TS_PACKET):
+        if out[base] != TS_SYNC:
+            continue
+        afc = (out[base + 3] >> 4) & 0x03
+        pos = base + 4
+        if afc in (2, 3):                       # adaptation field present
+            af_len = out[pos]
+            if af_len and (out[pos + 1] & 0x10) and af_len >= 7:   # PCR
+                q = pos + 2
+                pcr = (out[q] << 25 | out[q + 1] << 17 | out[q + 2] << 9 |
+                       out[q + 3] << 1 | out[q + 4] >> 7)
+                ext = ((out[q + 4] & 0x01) << 8) | out[q + 5]
+                pcr = (pcr + delta) % TS_WRAP
+                out[q] = (pcr >> 25) & 0xFF
+                out[q + 1] = (pcr >> 17) & 0xFF
+                out[q + 2] = (pcr >> 9) & 0xFF
+                out[q + 3] = (pcr >> 1) & 0xFF
+                out[q + 4] = ((pcr & 0x01) << 7) | 0x7E | (ext >> 8)
+                out[q + 5] = ext & 0xFF
+            pos += 1 + af_len
+        if afc in (0, 2):                       # no payload
+            continue
+        if not (out[base + 1] & 0x40):          # not the start of a PES
+            continue
+        if pos + 9 > base + TS_PACKET or out[pos:pos + 3] != b"\x00\x00\x01":
+            continue
+        flags = out[pos + 7]
+        opt = pos + 9
+        if flags & 0x80 and opt + 5 <= base + TS_PACKET:            # PTS
+            _ts_write(out, opt, _ts_read(out, opt) + delta,
+                      0x3 if flags & 0x40 else 0x2)
+            if flags & 0x40 and opt + 10 <= base + TS_PACKET:       # DTS
+                _ts_write(out, opt + 5, _ts_read(out, opt + 5) + delta, 0x1)
+    return bytes(out)
+
+
+SLATE_CACHE = {}           # position -> shifted bytes
+SLATE_CACHE_LOCK = threading.Lock()
+SLATE_CACHE_MAX = 64
+
+
+def slate_at(position) -> bytes:
+    """The slate segment for one timeline position, or the raw file."""
+    raw = (Path(CONFIG["root"]) / "offline" / "offline.ts").read_bytes()
+    if position is None:
+        return raw
+    with SLATE_CACHE_LOCK:
+        hit = SLATE_CACHE.get(position)
+    if hit is not None:
+        return hit
+    data = shift_timestamps(raw, position * CONFIG["slate_duration"])
+    with SLATE_CACHE_LOCK:
+        if len(SLATE_CACHE) >= SLATE_CACHE_MAX:
+            # Positions only ever climb, so the smallest are the stale ones.
+            for old in sorted(SLATE_CACHE)[:SLATE_CACHE_MAX // 2]:
+                SLATE_CACHE.pop(old, None)
+        SLATE_CACHE[position] = data
+    return data
 
 
 def safe(name: str) -> bool:
@@ -150,12 +262,19 @@ class Handler(BaseHTTPRequestHandler):
         # but only at the fingerprinted path. Regenerating the slate changes
         # the fingerprint, so a new slate is never masked by an old cached
         # copy (that bug cost hours once already).
-        m = re.match(r"^/live/_offline\.([0-9a-f]{8})(?:\.\d+)?\.ts$", path)
+        m = re.match(r"^/live/_offline(?:\.([0-9a-f]{8}))?(?:\.(\d+))?\.ts$", path)
         if m:
             fresh = m.group(1) == CONFIG.get("slate_version")
-            self.send_file(
-                Path(CONFIG["root"]) / "offline" / "offline.ts",
-                TS_TYPE,
+            position = int(m.group(2)) if m.group(2) is not None else None
+            try:
+                body = slate_at(position)
+            except OSError:
+                self.send_text("not found\n", 404)
+                return
+            # A position's bytes are a pure function of (slate, position),
+            # so they are immutable for as long as the fingerprint matches.
+            self.send_body(
+                body, TS_TYPE,
                 "public, max-age=31536000, immutable" if fresh
                 else "public, max-age=60",
             )
@@ -246,29 +365,22 @@ class Handler(BaseHTTPRequestHandler):
             st = SEQ_STATE.get(stream)
             if st is None:
                 st = {"seq": 0, "window": [], "live": False,
-                      "last_raw": "", "next_slate": 0.0, "touched": now}
+                      "last_raw": "", "next_slate": now,
+                      "slate_pos": 0, "disc_seq": 0, "touched": now}
                 SEQ_STATE[stream] = st
                 # Start with a full window rather than one entry that grows
                 # over the next few seconds. A player handed a single 2s
                 # fragment has nothing buffered ahead and stalls on the first
-                # jitter — the same failure the repeated-URI bug produced,
-                # just arriving by a different route. These are backdated so
-                # the next entry is due immediately, keeping the timeline on
-                # real time.
-                uri = f"/live/_offline.{CONFIG['slate_version']}"
-                for i in range(max(CONFIG["window"], 1)):
-                    # Discontinuity on each, for the same reason as below:
-                    # every slate entry is the same file, so its media
-                    # restarts at PTS 0 while the playlist advances.
-                    st["window"].append(
-                        (f"{uri}.{i % SLATE_POSITIONS}.ts", dur, True))
-                st["next_slate"] = now
+                # jitter. One more is due immediately: see the lead below.
+                for _ in range(keep):
+                    st["window"].append((self.slate_uri(st), dur, False, now))
 
             fresh = self.live_segments(stream)
             if fresh:
                 # Append only what has not been published yet, preserving
                 # ffmpeg's order.
                 new_entries = []
+                seam = not st["live"]
                 if st["last_raw"]:
                     try:
                         after = [n for n, _ in fresh]
@@ -276,12 +388,16 @@ class Handler(BaseHTTPRequestHandler):
                         pending = fresh[idx + 1:]
                     except ValueError:
                         # The name is gone from disk: the encoder restarted
-                        # and renumbered. Everything on offer is new.
+                        # and renumbered. Everything on offer is new, and
+                        # its timestamps start over, so this is a seam even
+                        # though the stream never went idle.
                         pending = fresh
+                        seam = True
                 else:
                     pending = fresh
                 for name, d in pending:
-                    new_entries.append((f"{name}", d, not st["live"]))
+                    new_entries.append((f"{name}", d, seam, now))
+                    seam = False
                     st["live"] = True
                 if new_entries:
                     st["last_raw"] = pending[-1][0]
@@ -289,56 +405,100 @@ class Handler(BaseHTTPRequestHandler):
                     # Slate resumes only after ingest has actually stopped.
                     st["next_slate"] = now + dur
             else:
-                # Idle. Add a slate entry when the previous one has played
-                # out, so the timeline advances at real time rather than as
-                # fast as the viewer polls.
-                if now >= st["next_slate"]:
-                    # A distinct URI per position: a player keys fragments by
-                    # URI, so repeating one URI reads as a single fragment —
-                    # the slate would play once (~2s) and stall with the
-                    # sequence still climbing. The bytes are the same object;
-                    # only the path differs.
-                    # The counter only has to make consecutive entries in
-                    # the window distinct, so it wraps over a small set.
-                    # Letting it climb forever would mint ~1800 immutable
-                    # cache entries per idle hour for what is one 35 KB
-                    # object.
-                    pos = st["seq"] + len(st["window"])
-                    uri = (f"/live/_offline.{CONFIG['slate_version']}"
-                           f".{pos % SLATE_POSITIONS}.ts")
-                    # Always a discontinuity, not just at the live->slate
-                    # seam: every slate fragment is the same file, so its
-                    # media restarts at PTS 0 while the playlist advances.
-                    # Without the marker a player treats the repeated
-                    # timestamps as already-buffered and stops advancing.
-                    st["window"].append((uri, dur, True))
+                # Idle. Slate entries are due on a fixed wall-clock cadence,
+                # one per slate duration, independent of when polls arrive.
+                if st["live"]:
+                    # The broadcast just stopped: the slate timeline starts
+                    # here, and its first entry is a real seam. Two entries
+                    # are due at once, so the slate runs one entry ahead of
+                    # the clock from the outset. The slate is synthetic, so
+                    # "ahead" costs nothing, and it is what keeps a viewer's
+                    # buffer from running dry: a live viewer sits about a
+                    # second behind the edge, and their picture has already
+                    # frozen by the time the encoder is known to be gone.
+                    # Every entry after these lands a full duration before
+                    # the player needs it, which also removes the race
+                    # between the entry cadence and the poll cadence that
+                    # otherwise leaves a poll just missing the next entry.
+                    st["next_slate"] = now - dur
                     st["live"] = False
                     st["last_raw"] = ""
-                    st["next_slate"] = max(now, st["next_slate"]) + dur
+                    seam = True
+                else:
+                    seam = False
+                if now - st["next_slate"] > dur * keep:
+                    # Nobody polled for a while. Skip ahead rather than
+                    # replaying the gap as a burst of entries; a returning
+                    # viewer wants the present, not a backlog.
+                    st["next_slate"] = now - dur * (keep - 1)
+                while now >= st["next_slate"]:
+                    st["window"].append((self.slate_uri(st), dur, seam, now))
+                    seam = False
+                    st["next_slate"] += dur
 
-            # Roll the window, advancing the sequence by whatever was dropped.
-            if len(st["window"]) > keep:
-                dropped = len(st["window"]) - keep
-                st["window"] = st["window"][dropped:]
-                st["seq"] += dropped
+            # Roll the window, advancing the sequence by whatever is dropped.
+            # The count is the normal limit, with one exception: a slate
+            # entry stays a while after the count would drop it. When a
+            # broadcast starts, the window turns over one 0.5 s segment
+            # every 0.5 s -- faster than a player still polling at the
+            # slate's 2 s cadence -- so two consecutive polls could share no
+            # entry at all. hls.js then has to guess how much time the
+            # missed entries covered, and guesses with the *new* target
+            # duration (1 s) rather than the slate's 2.1 s, placing live
+            # content four seconds too early: over media already buffered,
+            # behind the playhead, and the player stalls and seeks. Holding
+            # each slate entry for two slate durations plus a second keeps
+            # an overlap for any poll interval the player actually uses.
+            hold = CONFIG["slate_duration"] * 2 + 1.0
+            while len(st["window"]) > keep:
+                uri, _, disc, published = st["window"][0]
+                if uri.startswith("/live/_offline.") and now - published < hold:
+                    break
+                # RFC 8216 6.2.2: when a DISCONTINUITY tag leaves the
+                # window, EXT-X-DISCONTINUITY-SEQUENCE must go up by one.
+                # A player numbers timelines by counting the tags it can
+                # see; without this the numbering slides back as tags
+                # scroll off, a new timeline can reuse the number of an
+                # old one, and the player applies the old timeline's
+                # timestamp offset to the new content.
+                if disc:
+                    st["disc_seq"] += 1
+                del st["window"][0]
+                st["seq"] += 1
             # A discontinuity that scrolled to the front of the window is
             # still meaningful, but one on the very first entry of a brand
             # new timeline is not — there is nothing before it to break from.
             st["touched"] = now
             entries = list(st["window"])
             seq = st["seq"]
+            disc_seq = st.get("disc_seq", 0)
 
-        target = max(int(round(max((d for _, d, _ in entries), default=dur))), 1)
+        # Rounded up, not to nearest: EXT-X-TARGETDURATION must be at least
+        # the longest EXTINF, and round() would report 2 for a 2.133 s slate.
+        target = max(int(math.ceil(max((e[1] for e in entries), default=dur))), 1)
         lines = ["#EXTM3U", "#EXT-X-VERSION:3",
                  f"#EXT-X-MEDIA-SEQUENCE:{seq}",
+                 f"#EXT-X-DISCONTINUITY-SEQUENCE:{disc_seq}",
                  f"#EXT-X-TARGETDURATION:{target}"]
-        for i, (uri, d, disc) in enumerate(entries):
-            if disc and not (seq == 0 and i == 0):
+        for uri, d, disc, _ in entries:
+            if disc:
                 lines.append("#EXT-X-DISCONTINUITY")
             # Three decimals and the ", no desc" title are SRS's exact output.
             lines.append(f"#EXTINF:{d:.3f}, no desc")
             lines.append(uri)
         return ("\n".join(lines) + "\n").encode()
+
+    def slate_uri(self, st) -> str:
+        """Mint the next slate entry for a stream's timeline.
+
+        Positions climb forever and never wrap: position n carries
+        timestamps starting at n x duration, so a wrap would be a rewind
+        and need a discontinuity to hide. The cost is one immutable edge
+        cache entry per idle slate duration, for a 37 KB object.
+        """
+        n = st["slate_pos"]
+        st["slate_pos"] = n + 1
+        return f"/live/_offline.{CONFIG['slate_version']}.{n}.ts"
 
     def live_segments(self, stream: str):
         """The segments ffmpeg is currently advertising, oldest first.
@@ -367,6 +527,30 @@ class Handler(BaseHTTPRequestHandler):
                 pending = None
         return out
 
+    def ingest_grace(self, stream: str) -> float:
+        """How long ingest may go quiet before the stream counts as stopped.
+
+        --stale-after is the floor, tuned for 0.5 s segments. An encoder
+        sending 2 s segments is silent for 2 s between uploads by design, so
+        the grace scales with the segment length it is actually producing:
+        two segments' worth, read from the encoder's own playlist.
+        """
+        grace = float(CONFIG.get("stale_after", 15))
+        if grace <= 0:
+            return grace
+        longest = 0.0
+        try:
+            text = (stream_dir(stream) / "live.m3u8").read_text("utf-8", "replace")
+            for line in text.splitlines():
+                if line.startswith("#EXTINF:"):
+                    try:
+                        longest = max(longest, float(line.split(":", 1)[1].split(",")[0]))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        return max(grace, 2.0 * longest)
+
     def stream_stale(self, stream: str) -> bool:
         """True once a broadcast has clearly stopped.
 
@@ -381,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
         Uses the same grace period as /status so the two never disagree.
         """
         import time
-        grace = CONFIG.get("stale_after", 15)
+        grace = self.ingest_grace(stream)
         if grace <= 0:
             return False
         d = stream_dir(stream)
@@ -508,31 +692,6 @@ class Handler(BaseHTTPRequestHandler):
             st["mark"] = False
             return served, emit
 
-    def offline_playlist(self) -> str:
-        import time
-        dur = CONFIG["slate_duration"]
-        # Advances with the clock so the playlist reads as live. Kept small:
-        # a media sequence in the hundreds of thousands makes some players
-        # render black video.
-        seq = int(time.time() / dur) % 10000
-        lines = [
-            "#EXTM3U",
-            "#EXT-X-VERSION:3",
-            f"#EXT-X-MEDIA-SEQUENCE:{seq}",
-            f"#EXT-X-TARGETDURATION:{int(dur) or 1}",
-        ]
-        for i in range(CONFIG["slate_window"]):
-            # A distinct URI per slot and a discontinuity before each: the
-            # slate is one file, so players would otherwise dedupe the
-            # repeated URI and, even given distinct ones, reject the
-            # repeated PTS as already buffered.
-            lines.append("#EXT-X-DISCONTINUITY")
-            # Three decimals and the ", no desc" title are SRS's exact output.
-            lines.append(f"#EXTINF:{dur:.3f}, no desc")
-            lines.append(f"/live/_offline.{CONFIG['slate_version']}"
-                         f".{(seq + i) % SLATE_POSITIONS}.ts")
-        return "\n".join(lines) + "\n"
-
     def serve_segment(self, stream: str, name: str):
         path = stream_dir(stream) / name
         if name.endswith(".m3u8"):
@@ -555,12 +714,12 @@ class Handler(BaseHTTPRequestHandler):
         segs = sorted(d.glob("*.ts")) + sorted(d.glob("*.m4s")) if d.is_dir() else []
         newest = max((p.stat().st_mtime for p in segs), default=0)
         body = json.dumps({
-            "live": bool(segs) and (time.time() - newest) < CONFIG.get("stale_after", 15),
+            "live": bool(segs) and (time.time() - newest) < self.ingest_grace(stream),
             "segmentsBuffered": len(segs),
             "bufferedBytes": sum(p.stat().st_size for p in segs),
             "secondsSinceLastIngest": round(time.time() - newest, 2) if newest else -1,
             "playlistPresent": live.is_file(),
-        })
+        }, separators=(",", ":"))
         self.send_body(body.encode(), "application/json", "no-store")
 
     # ---- ingest ----------------------------------------------------------
@@ -569,6 +728,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self.ingest(write=False)
+
+    def do_POST(self):
+        # Nothing here takes a POST; 405 rather than the default 501 so a
+        # client learns the method is wrong, not that the server is broken.
+        self.drain()
+        self.send_response(405)
+        self.send_header("Allow", "GET, HEAD, PUT, DELETE")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def ingest(self, write: bool):
         # ffmpeg's http_persistent reuses one connection for every segment and
@@ -580,7 +748,12 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/ingest/([^/]+)/([^/]+)/([^/]+)$", path)
         if not m:
             self.drain()
-            self.send_text("not found\n", 404)
+            # Writes only exist under /ingest/; anywhere else the method
+            # is the problem, not the path.
+            self.send_response(405)
+            self.send_header("Allow", "GET, HEAD")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         key, stream, name = m.groups()
         # compare_digest so a wrong key does not leak its length by timing.
@@ -626,21 +799,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text("ok\n")
 
     def evict(self, directory: Path, just_written: str):
-        """Keep only the most recent segments in a stream's directory.
+        """Keep only the most recently written segments in a stream's directory.
 
-        Ordered by the counter in the filename rather than mtime: ffmpeg
-        numbers segments monotonically, and that is what the playlist
-        references, whereas mtimes can tie at this granularity.
+        Ordered by modification time, newest last. Ordering by the counter in
+        the filename looked right -- ffmpeg numbers segments monotonically --
+        but it breaks on every encoder restart: ffmpeg renumbers from zero,
+        so a fresh seg00000 sorts below whatever the previous run left behind
+        and is deleted the moment it arrives. The broadcast then never starts
+        and nothing reports an error. A first fix caught only restarts after
+        long runs (a new index far below the leftovers); a restart a few
+        minutes after a short run left indexes 29-47 on disk, the new 0-7
+        sorted below them, and the same silent failure came back.
 
-        But that ordering breaks across an encoder restart. ffmpeg renumbers
-        from zero, so a fresh seg00000 sorts *below* the seg04798 left over
-        from the previous run and lands in the slice being deleted -- every
-        new segment is removed the moment it arrives and the broadcast never
-        starts. Observed in production: ingest silently failed for ten
-        minutes while the encoder reported no error.
-
-        So a large backwards jump is treated as what it is, a new timeline,
-        and the previous one is discarded outright.
+        Write time has no such blind spot: what the playlist references is
+        always what was written last. Ties are broken by the counter, for a
+        filesystem with coarse timestamps.
         """
         keep = CONFIG["keep_segments"]
         if keep <= 0:
@@ -650,29 +823,20 @@ class Handler(BaseHTTPRequestHandler):
             files = [p for p in directory.iterdir() if p.suffix == suffix]
         except OSError:
             return
+        if len(files) <= keep:
+            return
 
         def index(p) -> int:
             m = re.search(r"(\d+)(?=\.[^.]+$)", p.name)
             return int(m.group(1)) if m else -1
 
-        fresh = index(Path(just_written))
-        if fresh >= 0:
-            # Anything numbered far above what just arrived belongs to a
-            # previous run. "Far" so that mere reordering of concurrent
-            # uploads is not mistaken for a restart.
-            stale_timeline = [p for p in files
-                              if index(p) > fresh + keep * 4]
-            if stale_timeline:
-                for old in stale_timeline:
-                    try:
-                        old.unlink()
-                    except OSError:
-                        pass
-                files = [p for p in files if p not in stale_timeline]
+        def age(p):
+            try:
+                return (p.stat().st_mtime_ns, index(p))
+            except OSError:
+                return (0, -1)
 
-        if len(files) <= keep:
-            return
-        for stale in sorted(files, key=index)[:-keep]:
+        for stale in sorted(files, key=age)[:-keep]:
             try:
                 stale.unlink()
             except OSError:
@@ -788,13 +952,26 @@ def main():
                     help="segments to advertise; 0 passes ffmpeg's playlist "
                          "through. A player starts at the oldest entry, so "
                          "this is the dominant latency term")
-    ap.add_argument("--slate-duration", type=float, default=2.0)
-    ap.add_argument("--slate-window", type=int, default=3)
+    # 2.1333 s, not 2: that is 32 video frames at 15 fps and exactly 100
+    # AAC frames at 48 kHz. No whole number of AAC frames sums to 2.000 s,
+    # so a 2 s slate carried a 26.7 ms audio surplus, and looping one fixed
+    # file accumulated it until the audio clock outran the available video
+    # and the picture froze with the buffer still full. EXTINF must match
+    # the real duration or the same drift reappears in the playlist.
+    ap.add_argument("--slate-duration", type=float, default=32.0 / 15.0)
+    ap.add_argument("--slate-window", type=int, default=3,
+                    help=argparse.SUPPRESS)   # accepted for old units; unused
     ap.add_argument("--max-body", type=int, default=32 * 1024 * 1024,
                     help="largest accepted upload, in bytes")
     ap.add_argument("--reap-after", type=int, default=300,
                     help="delete a stream's directory after this many seconds idle")
-    ap.add_argument("--stale-after", type=int, default=15,
+    # 1 s, not 15: a viewer sits about one second behind the newest segment,
+    # so a playlist that stops advancing freezes their picture within a
+    # second, and it stays frozen until the slate takes over. Fifteen seconds
+    # of that was the "stuck on the way to offline" complaint. One second is
+    # two missed 0.5 s segments; a hiccup that long costs a brief slate
+    # flash and two clean seams, which beats a frozen frame every time.
+    ap.add_argument("--stale-after", type=float, default=1.0,
                     help="serve the offline slate once ingest has been idle "
                          "this many seconds (0 disables)")
     ap.add_argument("--verbose", action="store_true")
@@ -807,10 +984,6 @@ def main():
     # viewers get a 404 for it.
     if args.keep_segments > 0 and args.keep_segments <= args.window:
         args.keep_segments = args.window + 1
-    # Two entries in one window must never share a slate URI, or a player
-    # collapses them into a single fragment and the slate stalls.
-    if args.window >= SLATE_POSITIONS:
-        sys.exit(f"--window must be below {SLATE_POSITIONS}")
     CONFIG.update(vars(args))
     Path(args.root).mkdir(parents=True, exist_ok=True)
 

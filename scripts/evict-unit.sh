@@ -29,14 +29,39 @@ def setup(names):
     for n in names:
         (d / n).write_bytes(b"x")
     return d
+import os
+def touch_order(d, names):
+    """Give files strictly increasing mtimes in the given order."""
+    base = 1_700_000_000
+    for i, n in enumerate(names):
+        os.utime(d / n, ns=((base + i) * 10**9, (base + i) * 10**9))
 
 print("-- encoder restart after a long run")
 d = setup(["seg%05d.ts" % i for i in range(4787, 4799)])
+touch_order(d, ["seg%05d.ts" % i for i in range(4787, 4799)])
 (d / "seg00000.ts").write_bytes(b"new")
 h.evict(d, "seg00000.ts")
 left = sorted(p.name for p in d.iterdir())
 check("seg00000.ts" in left, "the newly written segment survives")
-check(not any(n.startswith("seg047") for n in left), "stale timeline discarded")
+for i in range(1, 12):
+    (d / ("seg%05d.ts" % i)).write_bytes(b"new")
+    h.evict(d, "seg%05d.ts" % i)
+left = sorted(p.name for p in d.iterdir())
+check(not any(n.startswith("seg047") for n in left) and len(left) == 12,
+      "stale timeline displaced by the new one: %s..%s" % (left[0], left[-1]))
+shutil.rmtree(d)
+
+print("-- encoder restart shortly after a short run")
+# Leftovers numbered within a few dozen of zero: the case a threshold on
+# the counter cannot catch.
+d = setup(["seg%05d.ts" % i for i in range(29, 40)] + ["seg00046.ts", "seg00047.ts"])
+import time; time.sleep(0.01)
+for i in range(3):
+    (d / ("seg%05d.ts" % i)).write_bytes(b"new")
+    h.evict(d, "seg%05d.ts" % i)
+left = sorted(p.name for p in d.iterdir())
+check(all(("seg%05d.ts" % i) in left for i in range(3)),
+      "every new segment survives: %s" % left[:4])
 shutil.rmtree(d)
 
 print("-- steady state trims to keep_segments")
