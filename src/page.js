@@ -330,6 +330,53 @@ insists on the extension.</p>
 <p class="small muted">Then confirm a real HLS client can play it back:</p>
 <div class="snip"><pre><code id="cmd-verify"></code></pre></div>
 
+<!-- ============ OVERLAY ============ -->
+<h2>Brand overlay</h2>
+<p class="small muted">
+  A transparent page that draws your mark over the scene, styled to match the
+  OFFLINE card — same palette, same bitmap type — so live and offline read as
+  one identity. Add it in OBS as a <b>Browser</b> source (leave
+  <b>Local file</b> unticked), <code>1920×1080</code>, above your video.
+</p>
+
+<table>
+  <tr><th>Preset</th><th>URL</th></tr>
+  <tr><td>Brand, LIVE dot and a Sydney clock</td>
+      <td><div class="cfgval"><code id="ov-full"></code><button class="minicopy" data-copy="ov-full">Copy</button></div></td></tr>
+  <tr><td>Brand only, nothing moving but the sweep</td>
+      <td><div class="cfgval"><code id="ov-plain"></code><button class="minicopy" data-copy="ov-plain">Copy</button></div></td></tr>
+  <tr><td>Top-right corner</td>
+      <td><div class="cfgval"><code id="ov-tr"></code><button class="minicopy" data-copy="ov-tr">Copy</button></div></td></tr>
+</table>
+
+<p class="small muted">Everything is set through the query string, so one URL
+  covers every scene:</p>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>brand</code></td><td><code>KRSZ LIVE</code></td><td>Headline text</td></tr>
+  <tr><td><code>tag</code></td><td><code>HIGH PERFORMANCE</code></td>
+      <td>Subtitle, letter-spaced to match the headline's width</td></tr>
+  <tr><td><code>url</code></td><td><code>HTTPS://KRSZ.IN</code></td>
+      <td>Opposite-corner credit; <code>url=</code> hides it</td></tr>
+  <tr><td><code>pos</code></td><td><code>tl</code></td>
+      <td>Corner: <code>tl</code>, <code>tr</code>, <code>bl</code>, <code>br</code></td></tr>
+  <tr><td><code>live</code></td><td><code>0</code></td><td><code>1</code> adds a pulsing LIVE dot</td></tr>
+  <tr><td><code>clock</code></td><td><code>0</code></td><td><code>1</code> adds a running clock</td></tr>
+  <tr><td><code>tz</code></td><td><code>Australia/Sydney</code></td>
+      <td>Any IANA zone; <code>local</code> uses this machine's time</td></tr>
+  <tr><td><code>tzlabel</code></td><td>—</td><td>Short label before the digits, e.g. <code>SYD</code></td></tr>
+  <tr><td><code>scale</code></td><td><code>1</code></td><td>Size multiplier</td></tr>
+  <tr><td><code>accent</code></td><td><code>f6821f</code></td><td>Accent colour, hex without <code>#</code></td></tr>
+  <tr><td><code>shadow</code></td><td><code>1</code></td><td><code>0</code> drops the shadow behind the text</td></tr>
+</table>
+
+<div class="note">
+  The typeface has no lowercase: text is upper-cased, and anything outside
+  <code>A–Z 0–9 - . : /</code> renders as a space. Spaces in a value must be
+  written <code>%20</code>. Leave <b>Shutdown source when not visible</b>
+  unticked in OBS, or the animation restarts on every scene change.
+</div>
+
 <!-- ============ API ============ -->
 <h2>API</h2>
 
@@ -481,6 +528,11 @@ function playUrl(n)  { return ORIGIN + '/' + encodeURIComponent(n); }
 function playUrlExt(n) { return ORIGIN + '/' + encodeURIComponent(n) + '.m3u8'; }
 function playUrlFull(n) { return ORIGIN + '/live/' + encodeURIComponent(n) + '.m3u8'; }
 function ingestUrl(n, k) { return ORIGIN + '/ingest/' + k + '/' + n + '/live.m3u8'; }
+/** Overlay URL for a browser source. Unlike ingest, it carries no key. */
+function overlayUrl(params) {
+  const q = new URLSearchParams(params).toString();
+  return ORIGIN + '/overlay' + (q ? '?' + q : '');
+}
 function segPattern(n, k) { return ORIGIN + '/ingest/' + k + '/' + n + '/seg%05d.ts'; }
 
 function muxerSettings(n, k) {
@@ -535,6 +587,10 @@ function render() {
   setText('f-vset', videoEncoderSettings());
   setText('f-gop', String(30 * SEG_DUR));
   setText('qs-gop', String(30 * SEG_DUR));
+
+  setText('ov-full', overlayUrl({ live: 1, clock: 1, tzlabel: 'SYD' }));
+  setText('ov-plain', overlayUrl({}));
+  setText('ov-tr', overlayUrl({ pos: 'tr', live: 1, clock: 1, tzlabel: 'SYD' }));
 
   setText('cmd-ffmpeg', ffmpegCommand(n, k));
   setText('cmd-verify', verifyCommand(n));
