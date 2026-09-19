@@ -94,7 +94,14 @@ check(h.trim_window(done.encode(), "s") == done.encode(),
 
 print("── the slate playlist references the fingerprinted path")
 sl = h.offline_playlist()
-check("/live/_offline.deadbeef.ts" in sl, "slate URI carries the fingerprint")
+check("/live/_offline.deadbeef." in sl, "slate URI carries the fingerprint")
+# Each slot needs its own URI and its own discontinuity: the slate is one
+# file, so repeating a URI reads as the same fragment already played, and
+# even with distinct URIs the repeated PTS reads as already buffered.
+uris = [l for l in sl.splitlines() if l.startswith("/live/")]
+check(len(set(uris)) == len(uris), "slate slots have distinct URIs")
+check(sl.count("#EXT-X-DISCONTINUITY") == len(uris),
+      "every slate slot is preceded by a discontinuity")
 check("#EXT-X-ENDLIST" not in sl, "slate playlist never ends")
 
 print()

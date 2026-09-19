@@ -631,6 +631,16 @@ class Handler(BaseHTTPRequestHandler):
         Ordered by the counter in the filename rather than mtime: ffmpeg
         numbers segments monotonically, and that is what the playlist
         references, whereas mtimes can tie at this granularity.
+
+        But that ordering breaks across an encoder restart. ffmpeg renumbers
+        from zero, so a fresh seg00000 sorts *below* the seg04798 left over
+        from the previous run and lands in the slice being deleted -- every
+        new segment is removed the moment it arrives and the broadcast never
+        starts. Observed in production: ingest silently failed for ten
+        minutes while the encoder reported no error.
+
+        So a large backwards jump is treated as what it is, a new timeline,
+        and the previous one is discarded outright.
         """
         keep = CONFIG["keep_segments"]
         if keep <= 0:
@@ -640,13 +650,28 @@ class Handler(BaseHTTPRequestHandler):
             files = [p for p in directory.iterdir() if p.suffix == suffix]
         except OSError:
             return
-        if len(files) <= keep:
-            return
 
-        def index(p: Path) -> int:
+        def index(p) -> int:
             m = re.search(r"(\d+)(?=\.[^.]+$)", p.name)
             return int(m.group(1)) if m else -1
 
+        fresh = index(Path(just_written))
+        if fresh >= 0:
+            # Anything numbered far above what just arrived belongs to a
+            # previous run. "Far" so that mere reordering of concurrent
+            # uploads is not mistaken for a restart.
+            stale_timeline = [p for p in files
+                              if index(p) > fresh + keep * 4]
+            if stale_timeline:
+                for old in stale_timeline:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+                files = [p for p in files if p not in stale_timeline]
+
+        if len(files) <= keep:
+            return
         for stale in sorted(files, key=index)[:-keep]:
             try:
                 stale.unlink()
