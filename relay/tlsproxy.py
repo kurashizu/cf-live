@@ -121,6 +121,37 @@ class Proxy(socketserver.StreamRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # ffmpeg opens several connections at once and abandons some of them.
+    # The default of 5 filled up and new clients could not even complete a
+    # TCP connect.
+    request_queue_size = 128
+
+    def get_request(self):
+        """Accept in the clear, hand the handshake to the worker thread.
+
+        Wrapping the listening socket instead performs the TLS handshake
+        inside accept() on the main thread, so a single slow or abandoned
+        client blocks every other connection -- which is exactly how this
+        wedged: listen queue full, one thread alive, TCP connects timing out.
+        """
+        sock, addr = self.socket.accept()
+        return sock, addr
+
+    def process_request_thread(self, request, client_address):
+        try:
+            # Deadline on the handshake itself; an idle TCP connection that
+            # never sends a ClientHello must not hold a thread forever.
+            request.settimeout(15)
+            tls = self.tls_context.wrap_socket(request, server_side=True)
+        except Exception:
+            self.shutdown_request(request)
+            return
+        try:
+            self.finish_request(tls, client_address)
+        except Exception:
+            pass
+        finally:
+            self.shutdown_request(tls)
 
 
 def main():
@@ -139,7 +170,8 @@ def main():
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    # Held for the worker threads to use; the listening socket stays plain.
+    srv.tls_context = ctx
 
     print("tls on %s -> http://%s" % (args.listen, args.origin), flush=True)
     try:
