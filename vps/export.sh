@@ -24,7 +24,7 @@ node --input-type=module -e "
 import { landingPage } from './src/page.js';
 import { writeFileSync } from 'node:fs';
 const res = landingPage(new URL('https://REPLACE_ME/'), {
-  SEGMENT_DURATION: '1',
+  SEGMENT_DURATION: '0.5',
   PLAYLIST_SIZE: '3',
   MAX_SEGMENTS: '8',
 });

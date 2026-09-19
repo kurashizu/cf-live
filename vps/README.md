@@ -146,17 +146,17 @@ Unchanged from the Worker version, except the hostname. In
 | FFmpeg Output Type | `Output to URL` |
 | File path or URL | `https://<host>/ingest/<KEY>/main/live.m3u8` |
 | Container Format | `hls` |
-| **Keyframe interval (frames)** | **`30`** at 30 fps — see below |
+| **Keyframe interval (frames)** | **`15`** at 30 fps (`30` at 60 fps) — see below |
 
 Muxer settings:
 
 ```
-method=PUT http_persistent=1 ignore_io_errors=1 hls_time=1 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<host>/ingest/<KEY>/main/seg%05d.ts
+method=PUT http_persistent=1 ignore_io_errors=1 hls_time=0.5 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<host>/ingest/<KEY>/main/seg%05d.ts
 ```
 
 **Keyframe interval is the setting that determines latency.** Segments can
 only be cut on a keyframe, so OBS's default of 249 frames produces ~8s
-segments no matter what `hls_time` says — which turns a 1s configuration into
+segments no matter what `hls_time` says — which turns a 0.5s configuration into
 20-30s of observed delay. Set it to frame rate × segment duration.
 
 ## Playback

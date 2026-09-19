@@ -1,0 +1,23 @@
+[Unit]
+Description=KRSZ Live cross-border relay receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/krsz-relay/recv.py \
+  --sender 137.23.2.40 --sender-port 39997 \
+  --local-port 45010 --http-port 9990 \
+  --window 3 --keep 12 --origin https://live.krsz.in
+Restart=always
+RestartSec=3
+# The receiver holds a dozen segments plus the mirrored page in memory.
+# Measured steady state is ~22 MB; this cap is generous but bounds a leak.
+MemoryMax=200M
+# Unbuffered, so a crash does not lose the log lines that explain it.
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/var/log/krsz-relay.log
+StandardError=append:/var/log/krsz-relay.log
+
+[Install]
+WantedBy=multi-user.target

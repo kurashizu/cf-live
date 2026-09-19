@@ -61,7 +61,7 @@ Settings → Output → Output Mode: **Advanced** → **Recording** tab:
 | FFmpeg Output Type | `Output to URL` |
 | File path or URL | `https://<your-worker>/ingest/<KEY>/main/live.m3u8` |
 | Container Format | `hls` |
-| **Keyframe interval (frames)** | **`30`** — see below, this one controls latency |
+| **Keyframe interval (frames)** | **`15`** — see below, this one controls latency |
 | Video Bitrate | `2500` Kbps |
 | Video Encoder | `libx264` |
 | Audio Encoder | `aac` |
@@ -69,14 +69,14 @@ Settings → Output → Output Mode: **Advanced** → **Recording** tab:
 **Muxer Settings** (one line):
 
 ```
-method=PUT http_persistent=1 ignore_io_errors=1 hls_time=1 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<your-worker>/ingest/<KEY>/main/seg%05d.ts
+method=PUT http_persistent=1 ignore_io_errors=1 hls_time=0.5 hls_list_size=6 hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts hls_segment_filename=https://<your-worker>/ingest/<KEY>/main/seg%05d.ts
 ```
 
 **Keyframe interval** is the setting that actually determines latency, and OBS
 gets it wrong by default.
 
 A segment can only be cut on a keyframe. OBS ships with **249** frames in the
-`Keyframe interval (frames)` field, which is ~8s at 30 fps — so `hls_time=1` is
+`Keyframe interval (frames)` field, which is ~8s at 30 fps — so `hls_time=0.5` is
 ignored and you get 8s segments. That alone turns a 1s configuration into
 20-30s of observed latency.
 
@@ -164,7 +164,7 @@ A wrong key returns `403`. Stream and file names are restricted to
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SEGMENT_DURATION` | `1` | Seconds per segment. Must match OBS's `hls_time` **and** its keyframe interval. |
+| `SEGMENT_DURATION` | `0.5` | Seconds per segment. Must match OBS's `hls_time` **and** its keyframe interval (frame rate x this). |
 | `PLAYLIST_SIZE` | `3` | Segments advertised. The dominant latency term. |
 | `MAX_SEGMENTS` | `8` | Segments held in memory. Raised to `PLAYLIST_SIZE + 1` if set lower. Sets both jitter tolerance and worst-case latency. |
 | `MAX_WINDOW_SECONDS` | `5` | Ceiling on playlist span, guarding latency when segments come out longer than requested. |
@@ -262,7 +262,7 @@ ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
   -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -bf 0 \
   -g 30 -keyint_min 30 -sc_threshold 0 -b:v 2500k -pix_fmt yuv420p \
   -c:a aac -b:a 128k -ar 48000 -ac 2 \
-  -f hls -hls_time 1 -hls_list_size 6 \
+  -f hls -hls_time 0.5 -hls_list_size 6 \
   -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \
   -method PUT -http_persistent 1 -ignore_io_errors 1 \
   -hls_segment_filename "http://localhost:8787/ingest/$INGEST_KEY/main/seg%05d.ts" \

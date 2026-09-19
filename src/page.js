@@ -9,7 +9,7 @@
 
 export function landingPage(url, env) {
   const origin = url.origin;
-  const segDur = Number(env?.SEGMENT_DURATION ?? 1);
+  const segDur = Number(env?.SEGMENT_DURATION ?? 0.5);
   const playlistSize = Number(env?.PLAYLIST_SIZE ?? 6);
   const maxSegs = Number(env?.MAX_SEGMENTS ?? 10);
   // Measured, not guessed: one segment to encode, ~0.6s to upload, the window
@@ -307,8 +307,8 @@ insists on the extension.</p>
   what turns a ${segDur}s configuration into 20-30s of observed latency.
   <br><br>
   OBS ships with <code>249</code> frames here. Set it to
-  <b>frame rate × ${segDur}</b>: <code>${30 * segDur}</code> at 30 fps,
-  <code>${60 * segDur}</code> at 60 fps. The dedicated
+  <b>frame rate × ${segDur}</b>: <code>${Math.round(30 * segDur)}</code> at 30 fps,
+  <code>${Math.round(60 * segDur)}</code> at 60 fps. The dedicated
   <b>Keyframe interval</b> field wins over any <code>g=</code> in the encoder
   settings box, so setting it there alone has no effect.
 </div>

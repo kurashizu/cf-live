@@ -48,6 +48,8 @@ from rs import Codec
 M3U8 = "application/vnd.apple.mpegurl"
 TS_TYPE = "video/MP2T"
 
+CONFIG = {"window": 3}
+
 STATE = {
     "segments": collections.OrderedDict(),  # name -> bytes
     "playlist": b"",
@@ -277,7 +279,7 @@ def receiver_loop(args):
             STATE["stats"]["bye"] += 1
 
 
-def available_playlist(body, have):
+def available_playlist(body, have, window=0):
     """Trim a playlist to the fragments this relay actually holds.
 
     The sender advertises a segment once it has sent the shards; recovery
@@ -293,8 +295,14 @@ def available_playlist(body, have):
     header, entries = [], []
     pending = None
     seq = 0
+    longest = 0.0
     for line in body.decode("utf-8", "replace").splitlines():
         line = line.strip()
+        if line.startswith("#EXTINF:"):
+            try:
+                longest = max(longest, float(line.split(":", 1)[1].split(",")[0]))
+            except ValueError:
+                pass
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
             try:
                 seq = int(line.split(":", 1)[1])
@@ -312,11 +320,16 @@ def available_playlist(body, have):
     kept = [(inf, uri) for inf, uri in entries if uri in have]
     if not kept:
         return None
-    # Count only the leading absences: those shift the live edge. A hole in
-    # the middle would break continuity, so stop at the first one we hold.
+    # A player begins at the oldest advertised fragment, so window depth is
+    # the dominant latency term. Keep only the newest few.
+    if window > 0 and len(kept) > window:
+        kept = kept[-window:]
+    # The sequence must match the first fragment actually published, whether
+    # it was dropped for being unrecovered or for being outside the window.
+    first_uri = kept[0][1]
     dropped_front = 0
     for inf, uri in entries:
-        if uri in have:
+        if uri == first_uri:
             break
         dropped_front += 1
 
@@ -324,6 +337,12 @@ def available_playlist(body, have):
     for line in header:
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
             out.append("#EXT-X-MEDIA-SEQUENCE:%d" % (seq + dropped_front))
+        elif line.startswith("#EXT-X-TARGETDURATION:"):
+            # ffmpeg rounds to an integer and writes 0 for sub-second
+            # segments. RFC 8216 requires a positive integer that is at
+            # least the longest EXTINF, and a 0 makes players reject the
+            # playlist outright.
+            out.append("#EXT-X-TARGETDURATION:%d" % max(1, int(round(longest))))
         else:
             out.append(line)
     for inf, uri in kept:
@@ -405,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
             if not body:
                 self.fail(503, "no stream yet\n")
                 return
-            body = available_playlist(body, have)
+            body = available_playlist(body, have, CONFIG["window"])
             if body is None:
                 self.fail(503, "no fragments recovered yet\n")
                 return
@@ -434,6 +453,9 @@ def main():
                     help="local UDP port; the pinhole is opened from here")
     ap.add_argument("--http-port", type=int, default=9990)
     ap.add_argument("--stream-id", type=int, default=1)
+    ap.add_argument("--window", type=int, default=3,
+                    help="fragments to advertise; a player starts at the "
+                         "oldest, so this is the dominant latency term")
     ap.add_argument("--keep", type=int, default=12,
                     help="segments to retain for viewers")
     ap.add_argument("--origin", default="https://live.krsz.in",
@@ -444,6 +466,8 @@ def main():
                     help="pinhole refresh; must stay below the security "
                          "group's UDP idle timeout")
     args = ap.parse_args()
+
+    CONFIG["window"] = args.window
 
     t = threading.Thread(target=receiver_loop, args=(args,), daemon=True)
     t.start()

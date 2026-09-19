@@ -17,7 +17,7 @@ new_sqlite_classes = ["LiveRoom"]
 # Seconds per segment. Must match OBS's hls_time *and* its keyframe interval
 # (frame rate x this value), or segments come out however long the keyframes
 # allow and latency follows them.
-SEGMENT_DURATION = "1"
+SEGMENT_DURATION = "0.5"
 
 # Segments advertised in the playlist. This is the dominant latency term: a
 # player starts at the oldest entry, so each extra segment costs about one
