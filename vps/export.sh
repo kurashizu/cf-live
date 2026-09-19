@@ -36,6 +36,12 @@ writeFileSync('vps/index.html', patched);
 console.log('    vps/index.html', patched.length, 'bytes');
 "
 
+echo "==> OBS overlay"
+# Plain static file, no build step -- copied so the server ships it next to
+# index.html and broadcasters can point a browser source at /overlay.
+cp overlay/overlay.html vps/overlay.html
+echo "    vps/overlay.html $(wc -c < vps/overlay.html | tr -d ' ') bytes"
+
 echo
 echo "copy vps/ to the server, then:"
 echo "  sudo ./install.sh <ingest-key>"

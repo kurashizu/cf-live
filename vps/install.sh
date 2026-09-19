@@ -59,6 +59,10 @@ echo "==> installing the setup page"
 [ -f "$HERE/index.html" ] && cp "$HERE/index.html" "$WWW_DIR/index.html" \
   || echo "    index.html not found; skipping"
 
+echo "==> installing the OBS overlay"
+[ -f "$HERE/overlay.html" ] && cp "$HERE/overlay.html" "$WWW_DIR/overlay.html" \
+  || echo "    overlay.html not found; skipping (/overlay will 404)"
+
 echo "==> installing nginx config"
 sed "s/CHANGE_ME_INGEST_KEY/$KEY/" "$HERE/nginx.conf" > "$CONF"
 nginx -t

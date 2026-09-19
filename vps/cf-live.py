@@ -45,6 +45,9 @@ RESERVED = {
     # Endpoint prefixes: /status is the status API, and "offline" would
     # collide with the shared slate.
     "status", "offline",
+    # The OBS overlay page, which would otherwise be shadowed by a stream
+    # that happened to be called "overlay".
+    "overlay", "overlay.html",
 }
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -256,6 +259,16 @@ class Handler(BaseHTTPRequestHandler):
             # The page embeds its own script, so a cached copy means stale
             # player logic and a reload that appears to do nothing.
             self.send_file(page, "text/html; charset=utf-8", "no-store")
+            return
+
+        # The OBS overlay. Configured entirely through the query string, so
+        # one URL serves every scene and the broadcaster only has to paste a
+        # link into a browser source. Cached briefly: it is pulled by OBS on
+        # scene load, not by viewers, so staleness costs more than bandwidth.
+        if path in ("/overlay", "/overlay.html"):
+            page = Path(CONFIG["www"]) / "overlay.html"
+            self.send_file(page, "text/html; charset=utf-8",
+                           "public, max-age=60")
             return
 
         # The offline slate. Shared by every idle stream and cached hard —

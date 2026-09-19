@@ -80,7 +80,10 @@ A segment can only be cut on a keyframe. OBS ships with **249** frames in the
 ignored and you get 8s segments. That alone turns a 1s configuration into
 20-30s of observed latency.
 
-Set it to **frame rate × segment duration**: `30` at 30 fps, `60` at 60 fps.
+Set it to **frame rate × segment duration**. With the `hls_time=0.5` above
+that is `15` at 30 fps and `30` at 60 fps; at `hls_time=1` it would be `30`
+and `60`. A value larger than this makes `hls_time` unreachable, because the
+muxer cannot cut a segment until the next keyframe arrives.
 
 > The `Keyframe interval (frames)` field is a separate numeric input in the
 > FFmpeg output panel, and it overrides any `g=` written in Video Encoder

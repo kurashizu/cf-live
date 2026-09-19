@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>KRSZ Live — OBS overlay</title>
+<!--
+  Brand overlay for OBS, styled to match the OFFLINE slate
+  (scripts/slate.py): same palette, same 5x7 bitmap font, same lockup and
+  the same ping-pong sweep, so a viewer sees one continuous identity whether
+  the stream is live or waiting.
+
+  Add in OBS as a Browser source, 1920x1080, over your scene. The page is
+  transparent: OBS browser sources composite alpha, so only the drawn pixels
+  land on the scene.
+
+  Everything is configurable from the URL, so one file serves every scene:
+
+    overlay.html?brand=KRSZ%20LIVE&tag=HIGH%20PERFORMANCE&pos=tl&scale=1
+
+    brand   headline text            (default KRSZ LIVE)
+    tag     letter-spaced subtitle   (default HIGH PERFORMANCE)
+    url     bottom corner attribution (default HTTPS://KRSZ.IN, "" hides it)
+    pos     tl | tr | bl | br        corner for the lockup (default tl)
+    scale   size multiplier          (default 1)
+    accent  hex without #            (default f6821f, the slate's orange)
+    live    1 shows a LIVE pill with a pulsing dot (default 0)
+    clock   1 shows a running clock under the lockup (default 0)
+    fade    seconds to fade in on load (default 0.6)
+
+  Only characters present in the slate's font render; unknown ones become a
+  space, exactly as slate.py does. The font is duplicated here rather than
+  imported because an OBS browser source loads a single local file with no
+  build step and no network.
+-->
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: transparent;   /* OBS composites the alpha */
+    overflow: hidden;
+  }
+  /* Rendering happens on a canvas so the bitmap font stays pixel-exact at
+     any scale; CSS text would antialias and lose the slate's look. */
+  #c {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+  }
+</style>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ---------------------------------------------------------------- config
+const Q = new URLSearchParams(location.search);
+const num = (k, d) => {
+  const v = parseFloat(Q.get(k));
+  return Number.isFinite(v) ? v : d;
+};
+const CFG = {
+  brand:  Q.get('brand') ?? 'KRSZ LIVE',
+  tag:    Q.get('tag')   ?? 'HIGH PERFORMANCE',
+  url:    Q.get('url')   ?? 'HTTPS://KRSZ.IN',
+  pos:    (Q.get('pos')  ?? 'tl').toLowerCase(),
+  scale:  num('scale', 1),
+  accent: Q.get('accent') ?? 'f6821f',
+  live:   Q.get('live') === '1',
+  clock:  Q.get('clock') === '1',
+  fade:   num('fade', 0.6),
+  // On by default: the slate sits on its own dark background, but an
+  // overlay sits on whatever the camera sees, and the dim tagline
+  // disappears over a bright frame without a shadow behind it.
+  shadow: Q.get('shadow') !== '0',
+  // The clock follows the origin, in Sydney, so what viewers read is the
+  // broadcast's clock and not whatever the encoder machine is set to.
+  // tz= takes any IANA zone; tz=local uses the machine's own time.
+  tz:       Q.get('tz') ?? 'Australia/Sydney',
+  tz_label: Q.get('tzlabel') ?? '',
+  secs:     Q.get('secs') !== '0',
+};
+
+// Palette lifted from scripts/slate.py so the overlay and the OFFLINE card
+// are the same design, not two similar ones.
+const BG     = [10, 11, 14];
+const FG     = [150, 154, 163];
+const DIM    = [52, 55, 62];
+const TRACK  = [26, 28, 33];
+const ACCENT = hexToRgb(CFG.accent) || [246, 130, 31];
+
+function hexToRgb(h) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(h.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+const blend = (a, b, t) => [0, 1, 2].map(i => Math.round(a[i] + (b[i] - a[i]) * t));
+const css = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+// ------------------------------------------------------------------ font
+// The 5x7 glyphs from scripts/slate.py, plus the digits the clock needs.
+const F = {
+  'A':["01110","10001","10001","11111","10001","10001","10001"],
+  'B':["11110","10001","10001","11110","10001","10001","11110"],
+  'C':["01110","10001","10000","10000","10000","10001","01110"],
+  'D':["11110","10001","10001","10001","10001","10001","11110"],
+  'E':["11111","10000","10000","11110","10000","10000","11111"],
+  'F':["11111","10000","10000","11110","10000","10000","10000"],
+  'G':["01110","10001","10000","10111","10001","10001","01110"],
+  'H':["10001","10001","10001","11111","10001","10001","10001"],
+  'I':["11111","00100","00100","00100","00100","00100","11111"],
+  'J':["00111","00010","00010","00010","00010","10010","01100"],
+  'K':["10001","10010","10100","11000","10100","10010","10001"],
+  'L':["10000","10000","10000","10000","10000","10000","11111"],
+  'M':["10001","11011","10101","10101","10001","10001","10001"],
+  'N':["10001","11001","10101","10011","10001","10001","10001"],
+  'O':["01110","10001","10001","10001","10001","10001","01110"],
+  'P':["11110","10001","10001","11110","10000","10000","10000"],
+  'Q':["01110","10001","10001","10001","10101","10010","01101"],
+  'R':["11110","10001","10001","11110","10100","10010","10001"],
+  'S':["01111","10000","10000","01110","00001","00001","11110"],
+  'T':["11111","00100","00100","00100","00100","00100","00100"],
+  'U':["10001","10001","10001","10001","10001","10001","01110"],
+  'V':["10001","10001","10001","10001","10001","01010","00100"],
+  'W':["10001","10001","10001","10101","10101","11011","10001"],
+  'X':["10001","10001","01010","00100","01010","10001","10001"],
+  'Y':["10001","10001","01010","00100","00100","00100","00100"],
+  'Z':["11111","00001","00010","00100","01000","10000","11111"],
+  '0':["01110","10001","10011","10101","11001","10001","01110"],
+  '1':["00100","01100","00100","00100","00100","00100","01110"],
+  '2':["01110","10001","00001","00010","00100","01000","11111"],
+  '3':["11110","00001","00001","01110","00001","00001","11110"],
+  '4':["00010","00110","01010","10010","11111","00010","00010"],
+  '5':["11111","10000","10000","11110","00001","00001","11110"],
+  '6':["00110","01000","10000","11110","10001","10001","01110"],
+  '7':["11111","00001","00010","00100","01000","01000","01000"],
+  '8':["01110","10001","10001","01110","10001","10001","01110"],
+  '9':["01110","10001","10001","01111","00001","00010","01100"],
+  '-':["00000","00000","00000","11111","00000","00000","00000"],
+  '.':["00000","00000","00000","00000","00000","01100","01100"],
+  ':':["00000","01100","01100","00000","01100","01100","00000"],
+  '/':["00001","00010","00010","00100","01000","01000","10000"],
+  ' ':["00000","00000","00000","00000","00000","00000","00000"],
+};
+
+// --------------------------------------------------------------- drawing
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+// Design grid. The slate is 854x480; the overlay is authored against the
+// same proportions and then scaled to whatever OBS gives us, so the lockup
+// keeps the slate's relative weight on a 1080p canvas.
+const DW = 854, DH = 480;
+let S = 1;              // device pixels per design unit
+let ox = 0, oy = 0;     // letterbox offset
+
+function resize() {
+  const w = cv.clientWidth || DW, h = cv.clientHeight || DH;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(w * dpr);
+  cv.height = Math.round(h * dpr);
+  // Cover, not contain: the overlay anchors to corners, so we want the
+  // design grid to span the full frame in both axes.
+  S = Math.min(cv.width / DW, cv.height / DH) * CFG.scale;
+  ox = 0; oy = 0;
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+
+function textWidth(s, scale, track = 1) {
+  return s.length * (5 + track) * scale - track * scale;
+}
+
+/**
+ * Current time in CFG.tz as HH:MM or HH:MM:SS.
+ *
+ * Intl gives the zone conversion, including DST, without shipping a table.
+ * If the zone name is rejected (very old CEF builds), fall back to local
+ * time rather than letting the overlay throw every frame.
+ */
+let tzFmt = null, tzBroken = false;
+function clockText() {
+  const opts = {
+    hour: '2-digit', minute: '2-digit', hour12: false,
+    ...(CFG.secs ? { second: '2-digit' } : {}),
+  };
+  if (!tzFmt && !tzBroken) {
+    try {
+      tzFmt = new Intl.DateTimeFormat('en-GB', CFG.tz === 'local'
+        ? opts : { ...opts, timeZone: CFG.tz });
+    } catch (e) {
+      tzBroken = true;
+    }
+  }
+  const d = new Date();
+  if (tzFmt) {
+    // en-GB with hour12:false yields "HH:MM:SS"; normalise the 24:00 case
+    // some engines emit at midnight.
+    return tzFmt.format(d).replace(/^24:/, '00:');
+  }
+  const p = n => String(n).padStart(2, '0');
+  return CFG.secs
+    ? `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    : `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** Draw a bitmap string. x,y are in design units; align picks the anchor. */
+function text(s, x, y, scale, colour, track = 1, align = 'left', alpha = 1) {
+  const gw = (5 + track) * scale;
+  const total = textWidth(s, scale, track);
+  let x0 = x;
+  if (align === 'right') x0 = x - total;
+  else if (align === 'center') x0 = x - total / 2;
+  const y0 = y - (7 * scale) / 2;
+  const up = s.toUpperCase();
+
+  // Paint the glyphs twice: once offset in near-black, once in colour. The
+  // shadow is what keeps the DIM tagline readable over a bright shot.
+  const passes = CFG.shadow
+    ? [[scale, scale, [0, 0, 0], 0.55 * alpha], [0, 0, colour, alpha]]
+    : [[0, 0, colour, alpha]];
+
+  for (const [dx, dy, col, a] of passes) {
+    ctx.fillStyle = css(col, a);
+    for (let i = 0; i < up.length; i++) {
+      const g = F[up[i]] || F[' '];
+      for (let r = 0; r < 7; r++) {
+        const line = g[r];
+        for (let c = 0; c < 5; c++) {
+          if (line[c] !== '1') continue;
+          // One fillRect per lit cell keeps the blocky edges crisp.
+          ctx.fillRect(
+            Math.round((x0 + i * gw + c * scale + dx) * S),
+            Math.round((y0 + r * scale + dy) * S),
+            Math.ceil(scale * S), Math.ceil(scale * S));
+        }
+      }
+    }
+  }
+}
+
+function rect(x0, y0, x1, y1, colour, alpha = 1) {
+  ctx.fillStyle = css(colour, alpha);
+  ctx.fillRect(Math.round(x0 * S), Math.round(y0 * S),
+               Math.ceil((x1 - x0) * S), Math.ceil((y1 - y0) * S));
+}
+
+// ---------------------------------------------------------------- layout
+// Corner anchors in design units, matching the slate's 40px margin.
+const M = 40;
+function anchor() {
+  const right  = CFG.pos === 'tr' || CFG.pos === 'br';
+  const bottom = CFG.pos === 'bl' || CFG.pos === 'br';
+  return {
+    x: right ? DW - M : M,
+    y: bottom ? DH - M - 30 : M,
+    align: right ? 'right' : 'left',
+    right, bottom,
+  };
+}
+
+const t0 = performance.now();
+
+function draw(now) {
+  const t = (now - t0) / 1000;
+  ctx.clearRect(0, 0, cv.width, cv.height);   // stay transparent for OBS
+
+  // Fade in once, so switching scenes in OBS does not pop.
+  const fade = CFG.fade > 0 ? Math.min(1, t / CFG.fade) : 1;
+
+  // The slate's 2.1333s ping-pong, reused verbatim so both animations
+  // breathe at the same rate.
+  const SEG = 32 / 15;
+  const phase = (t % SEG) / SEG;
+  const sweep = (1 - Math.cos(2 * Math.PI * phase)) / 2;
+
+  const A = anchor();
+  const WM_SCALE = 2;
+  const brand = CFG.brand;
+  const brandW = textWidth(brand, WM_SCALE, 1);
+
+  // Tagline tracking is solved so it spans exactly the brand's width, the
+  // same trick slate.py uses to make the two lines one aligned block.
+  let tagTrack = 1;
+  if (CFG.tag.length > 1) {
+    tagTrack = Math.max(1, Math.round((brandW / 1 - 5 * CFG.tag.length) /
+                                      (CFG.tag.length - 1)));
+  }
+
+  const bx = A.x;
+  const by = A.y;
+  text(brand, bx, by, WM_SCALE, blend(BG, ACCENT, 0.75), 1, A.align, fade);
+  if (CFG.tag) text(CFG.tag, bx, by + 22, 1, DIM, tagTrack, A.align, fade);
+
+  // Sweep bar directly under the lockup, spanning the brand's width, so the
+  // motion reads as part of the mark rather than a separate element.
+  const trackY = by + 34;
+  const tx0 = A.align === 'right' ? bx - brandW : bx;
+  rect(tx0, trackY, tx0 + brandW, trackY + 2, TRACK, fade);
+  const barW = Math.max(18, brandW * 0.28);
+  const barX = tx0 + (brandW - barW) * sweep;
+  for (let i = 0; i < barW; i++) {
+    const edge = 1 - Math.abs(i - barW / 2) / (barW / 2);
+    rect(barX + i, trackY, barX + i + 1, trackY + 2,
+         blend(TRACK, ACCENT, edge), fade);
+  }
+
+  // Optional LIVE pill: a breathing dot plus the word, in the accent colour.
+  if (CFG.live) {
+    const glow = (1 - Math.cos(2 * Math.PI * phase)) / 2;
+    const py = trackY + 18;
+    const dotR = 4;
+    const dx = A.align === 'right' ? bx - brandW + dotR : bx + dotR;
+    // A round dot reads as a status light; a square one reads as a stuck
+    // pixel, so this is the one element that breaks the bitmap grid.
+    ctx.fillStyle = css(blend(DIM, ACCENT, 0.35 + 0.65 * glow), fade);
+    ctx.beginPath();
+    ctx.arc(dx * S, py * S, dotR * S, 0, Math.PI * 2);
+    ctx.fill();
+    text('LIVE', dx + dotR + 8, py, 1, blend(BG, ACCENT, 0.9), 2, 'left', fade);
+  }
+
+  // Optional clock. Defaults to Sydney, where the origin runs, so the time
+  // on screen is the broadcast's own clock rather than the encoder box's.
+  if (CFG.clock) {
+    const cy = CFG.live ? trackY + 40 : trackY + 18;
+    const hms = clockText();
+    if (CFG.tz_label) {
+      // Label sits left of the digits at the same size, dimmed, so the
+      // clock still reads as one unit.
+      const lw = textWidth(CFG.tz_label, 1, 1) + 6;
+      if (A.align === 'right') {
+        text(hms, bx, cy, 1, FG, 1, 'right', fade);
+        text(CFG.tz_label, bx - textWidth(hms, 1, 1) - 6, cy, 1, DIM, 1,
+             'right', fade);
+      } else {
+        text(CFG.tz_label, bx, cy, 1, DIM, 1, 'left', fade);
+        text(hms, bx + lw, cy, 1, FG, 1, 'left', fade);
+      }
+    } else {
+      text(hms, bx, cy, 1, FG, 1, A.align, fade);
+    }
+  }
+
+  // Attribution in the opposite corner, same weight as the brand.
+  if (CFG.url) {
+    const ux = A.right ? M : DW - M;
+    const uy = A.bottom ? M : DH - M;
+    text(CFG.url, ux, uy, WM_SCALE, blend(BG, ACCENT, 0.75), 1,
+         A.right ? 'left' : 'right', fade);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+resize();
+requestAnimationFrame(draw);
+</script>
