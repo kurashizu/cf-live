@@ -85,7 +85,7 @@ const CFG = {
   // Bar layout: a full-width strip along the bottom instead of a corner
   // lockup. Sized in the same design units as everything else.
   bar:         Q.get('bar') === '1',
-  barh:        num('barh', 54),
+  barh:        num('barh', 46),
   barscale:    num('barscale', 1),
   baropacity:  num('baropacity', 1),
 };
@@ -302,19 +302,18 @@ function drawBar(fade, sweep, phase) {
   ctx.fillStyle = g;
   ctx.fillRect(0, Math.round(y0 * S), cv.width, Math.ceil(H * S) + 2);
 
-  // A hairline along the top edge separates the bar from the picture, and
-  // the travelling highlight ties it to the slate's sweep.
+  // A static hairline separates the bar from the picture. The slate's
+  // travelling highlight is deliberately not reused here: on a holding card
+  // it signals "still alive", but spanning the full width of a live shot it
+  // just drags the eye away from the content for the whole broadcast.
   rect(0, y0, VW, y0 + 0.8, TRACK, 0.9 * fade);
-  const barW = VW * 0.18;
-  const bx = (VW - barW) * sweep;
-  for (let i = 0; i < barW; i += 1) {
-    const edge = 1 - Math.abs(i - barW / 2) / (barW / 2);
-    rect(bx + i, y0, bx + i + 1, y0 + 0.8, blend(TRACK, ACCENT, edge), fade);
-  }
 
   // --- left: brand lockup -------------------------------------------------
-  const cyBrand = y0 + H * 0.38;   // upper row: brand / clock
-  const cySub   = y0 + H * 0.70;   // lower row: tagline / zone
+  // Both rows sit low in the band: the gradient is weakest at its top, so
+  // keeping type in the opaque half is what makes it readable, and it also
+  // leaves more of the picture unobstructed.
+  const cyBrand = y0 + H * 0.50;   // upper row: brand / clock
+  const cySub   = y0 + H * 0.79;   // lower row: tagline / zone
   const bs = CFG.barscale;            // type scale inside the bar
   text(CFG.brand, pad, cyBrand, 2 * bs, blend(BG, ACCENT, 0.82), 1, 'left', fade);
 
@@ -340,6 +339,9 @@ function drawBar(fade, sweep, phase) {
 
   // --- LIVE pill, left of the clock --------------------------------------
   if (CFG.live) {
+    // A narrow pulse, not the slate's full swing: this dot sits beside live
+    // content for hours, so it should read as a steady indicator that
+    // happens to breathe, not as something blinking for attention.
     const glow = (1 - Math.cos(2 * Math.PI * phase)) / 2;
     const clockW = CFG.clock ? textWidth(clockText(), 2 * CFG.barscale, 1) : 0;
     const gap = CFG.clock ? 26 : 0;
@@ -348,7 +350,7 @@ function drawBar(fade, sweep, phase) {
     const r = 3.2 * CFG.barscale;
     text('LIVE', lx, ly, CFG.barscale, blend(BG, ACCENT, 0.9), 2, 'right', fade);
     const lw = textWidth('LIVE', CFG.barscale, 2);
-    ctx.fillStyle = css(blend(DIM, ACCENT, 0.35 + 0.65 * glow), fade);
+    ctx.fillStyle = css(blend(DIM, ACCENT, 0.62 + 0.24 * glow), fade);
     ctx.beginPath();
     ctx.arc((lx - lw - 9) * S, ly * S, r * S, 0, Math.PI * 2);
     ctx.fill();

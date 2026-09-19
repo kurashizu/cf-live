@@ -44,7 +44,7 @@ Append them to the URL, e.g.
 | `fade` | `0.6` | Fade-in seconds on load |
 | `shadow` | `1` | Drop shadow; `0` turns it off |
 | `bar` | `0` | `1` switches to a full-width bottom bar: brand left, clock right, on a background band |
-| `barh` | `54` | Bar height, in the 854×480 design grid's units |
+| `barh` | `46` | Bar height, in the 854×480 design grid's units |
 | `baropacity` | `1` | Background band opacity, `0`–`1` |
 | `tz` | `Australia/Sydney` | Clock timezone, any IANA name; `local` uses the machine's own |
 | `tzlabel` | *(none)* | Short label before the digits, e.g. `SYD` |
