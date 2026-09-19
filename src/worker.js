@@ -572,6 +572,12 @@ export class LiveRoom {
         `#EXT-X-MEDIA-SEQUENCE:${seq}`,
       ];
       for (let i = 0; i < count; i++) {
+        // Every slot is the same file, so its media restarts at PTS 0 while
+        // the playlist advances. Without this marker a player places the
+        // fragment at i x duration, finds timestamps that rewind, treats it
+        // as already buffered, and stops advancing — the slate freezes after
+        // one fragment with no error reported.
+        lines.push('#EXT-X-DISCONTINUITY');
         lines.push(`#EXTINF:${SLATE_DURATION.toFixed(3)}, no desc`);
         // Distinct URL per slot: players dedupe by URI, and repeating one
         // would be read as the same segment already played rather than the

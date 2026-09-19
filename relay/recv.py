@@ -43,12 +43,17 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wire
+from page import PAGE
 from rs import Codec
 
 M3U8 = "application/vnd.apple.mpegurl"
 TS_TYPE = "video/MP2T"
 
 CONFIG = {"window": 3}
+
+# Offset applied to the published media sequence so it never decreases, even
+# when the sender restarts and renumbers from zero.
+SEQ_GUARD = {"offset": 0, "last_in": -1, "last_out": -1}
 
 STATE = {
     "segments": collections.OrderedDict(),  # name -> bytes
@@ -57,43 +62,7 @@ STATE = {
     "stats": collections.Counter(),
     "last_packet": 0.0,
     "started": time.time(),
-    # The frontend, mirrored from the origin. Held in memory and refreshed
-    # in the background: fetching it per request would put the origin's
-    # 280 ms RTT and 730 ms TCP jitter in front of every page load.
-    "page": b"",
-    "page_fetched": 0.0,
 }
-
-
-def mirror_page(origin, interval, log_once=[False]):
-    """Keep a local copy of the origin's landing page.
-
-    Rewrites the origin's own absolute URLs to relative ones so the player
-    on the mirrored page talks to this relay rather than reaching back
-    across the border, which is the whole point of running it here.
-    """
-    import urllib.request
-    while True:
-        try:
-            req = urllib.request.Request(origin + "/")
-            # Cloudflare answers urllib's default agent with 403.
-            req.add_header("User-Agent", "krsz-relay/1")
-            with urllib.request.urlopen(req, timeout=20) as f:
-                body = f.read()
-            if body:
-                body = body.replace(b"https://live.krsz.in", b"")
-                with STATE["lock"]:
-                    STATE["page"] = body
-                    STATE["page_fetched"] = time.time()
-                STATE["stats"]["page_mirrored"] += 1
-                if not log_once[0]:
-                    print("mirrored frontend (%d bytes)" % len(body), flush=True)
-                    log_once[0] = True
-        except Exception as e:
-            STATE["stats"]["page_error"] += 1
-            if not log_once[0]:
-                print("frontend mirror failed: %s" % type(e).__name__, flush=True)
-        time.sleep(interval)
 
 
 class Reassembler(object):
@@ -279,6 +248,22 @@ def receiver_loop(args):
             STATE["stats"]["bye"] += 1
 
 
+def monotonic_seq(raw):
+    """Map the sender's sequence onto one that never goes backwards.
+
+    A restarted sender renumbers from zero. Publishing that verbatim reads
+    to a player as a different stream, and it responds by never loading
+    another fragment -- a permanent stall, not a glitch.
+    """
+    g = SEQ_GUARD
+    if g["last_in"] >= 0 and raw < g["last_in"]:
+        # Resume just past whatever viewers were last shown.
+        g["offset"] = g["last_out"] + 1 - raw
+    g["last_in"] = raw
+    g["last_out"] = raw + g["offset"]
+    return g["last_out"]
+
+
 def available_playlist(body, have, window=0):
     """Trim a playlist to the fragments this relay actually holds.
 
@@ -294,30 +279,38 @@ def available_playlist(body, have, window=0):
     """
     header, entries = [], []
     pending = None
+    pending_disc = False
     seq = 0
     longest = 0.0
     for line in body.decode("utf-8", "replace").splitlines():
         line = line.strip()
-        if line.startswith("#EXTINF:"):
-            try:
-                longest = max(longest, float(line.split(":", 1)[1].split(",")[0]))
-            except ValueError:
-                pass
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
             try:
                 seq = int(line.split(":", 1)[1])
             except ValueError:
                 pass
             header.append(line)
+        elif line == "#EXT-X-DISCONTINUITY":
+            # Belongs to the fragment that follows, not the header. Treating
+            # it as a header line hoisted every marker to the top of the
+            # playlist, which tells a player the break happens somewhere it
+            # does not and leaves the real breaks unmarked.
+            pending_disc = True
         elif line.startswith("#EXTINF:"):
             pending = line
+            try:
+                longest = max(longest,
+                              float(line.split(":", 1)[1].split(",")[0]))
+            except ValueError:
+                pass
         elif line and not line.startswith("#"):
-            entries.append((pending, line))
+            entries.append((pending_disc, pending, line))
             pending = None
+            pending_disc = False
         elif line:
             header.append(line)
 
-    kept = [(inf, uri) for inf, uri in entries if uri in have]
+    kept = [e for e in entries if e[2] in have]
     if not kept:
         return None
     # A player begins at the oldest advertised fragment, so window depth is
@@ -326,17 +319,18 @@ def available_playlist(body, have, window=0):
         kept = kept[-window:]
     # The sequence must match the first fragment actually published, whether
     # it was dropped for being unrecovered or for being outside the window.
-    first_uri = kept[0][1]
+    first_uri = kept[0][2]
     dropped_front = 0
-    for inf, uri in entries:
+    for _disc, _inf, uri in entries:
         if uri == first_uri:
             break
         dropped_front += 1
 
+    published = monotonic_seq(seq + dropped_front)
     out = []
     for line in header:
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-            out.append("#EXT-X-MEDIA-SEQUENCE:%d" % (seq + dropped_front))
+            out.append("#EXT-X-MEDIA-SEQUENCE:%d" % published)
         elif line.startswith("#EXT-X-TARGETDURATION:"):
             # ffmpeg rounds to an integer and writes 0 for sub-second
             # segments. RFC 8216 requires a positive integer that is at
@@ -345,7 +339,9 @@ def available_playlist(body, have, window=0):
             out.append("#EXT-X-TARGETDURATION:%d" % max(1, int(round(longest))))
         else:
             out.append(line)
-    for inf, uri in kept:
+    for disc, inf, uri in kept:
+        if disc:
+            out.append("#EXT-X-DISCONTINUITY")
         if inf:
             out.append(inf)
         out.append(uri)
@@ -404,15 +400,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_payload(body, "application/json", "no-store")
             return
 
-        # The mirrored frontend. Served at the root only; every stream name
-        # still resolves to a playlist below.
+        # This host's own page. Not the origin's: that one documents an
+        # ingest endpoint and OBS settings which do not exist here.
         if path in ("/", "/index.html"):
-            with STATE["lock"]:
-                page = STATE["page"]
-            if page:
-                self.send_payload(page, "text/html; charset=utf-8", "no-store")
-            else:
-                self.fail(503, "frontend not mirrored yet\n")
+            self.send_payload(PAGE.encode("utf-8"),
+                              "text/html; charset=utf-8", "no-store")
             return
 
         # Playlist. Never cached: a player given identical bytes concludes
@@ -458,10 +450,6 @@ def main():
                          "oldest, so this is the dominant latency term")
     ap.add_argument("--keep", type=int, default=12,
                     help="segments to retain for viewers")
-    ap.add_argument("--origin", default="https://live.krsz.in",
-                    help="where to mirror the frontend from")
-    ap.add_argument("--page-refresh", type=float, default=300.0,
-                    help="seconds between frontend refreshes")
     ap.add_argument("--hello-interval", type=float, default=2.0,
                     help="pinhole refresh; must stay below the security "
                          "group's UDP idle timeout")
@@ -471,9 +459,6 @@ def main():
 
     t = threading.Thread(target=receiver_loop, args=(args,), daemon=True)
     t.start()
-    threading.Thread(target=mirror_page,
-                     args=(args.origin, args.page_refresh),
-                     daemon=True).start()
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
     srv.daemon_threads = True

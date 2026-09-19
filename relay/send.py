@@ -25,6 +25,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,11 +66,6 @@ def live_peers(ttl):
             PEERS.pop(addr, None)
             print("peer timed out %s:%d" % addr, flush=True)
         return list(PEERS.keys())
-
-
-def segment_index(name):
-    m = re.search(r"(\d+)(?=\.[^.]+$)", name)
-    return int(m.group(1)) if m else -1
 
 
 def send_segment(sock, peers, stream_id, seq, data, k, n, codec, pace):
@@ -146,19 +142,26 @@ def rewrite_playlist(body, mapping):
     """
     out = []
     pending = None
+    pending_disc = False
     for line in body.decode("utf-8", "replace").splitlines():
         s = line.strip()
+        if s == "#EXT-X-DISCONTINUITY":
+            # Held until its fragment is known to be relayed: emitting it
+            # before a dropped entry would apply the break to the wrong
+            # fragment.
+            pending_disc = True
+            continue
         if s.startswith("#EXTINF:"):
             pending = s
             continue
         if s and not s.startswith("#"):
-            if s.startswith("/"):
-                pending = None      # origin slate, not relayed
-                continue
             new = mapping.get(s)
             if new is None:
                 pending = None
                 continue
+            if pending_disc:
+                out.append("#EXT-X-DISCONTINUITY")
+                pending_disc = False
             if pending:
                 out.append(pending)
                 pending = None
@@ -186,6 +189,9 @@ def main():
                          "4.3, because a larger sample deviates less: "
                          "simulated segment loss falls from 3.7%% to under "
                          "0.001%% at the worst measured loss rate.")
+    ap.add_argument("--origin", default="http://127.0.0.1:9999",
+                    help="where to read the continuous playlist from; the "
+                         "local relay, not the public hostname")
     ap.add_argument("--peer-ttl", type=float, default=15.0)
     ap.add_argument("--pace", type=float, default=0.25,
                     help="seconds to spread one segment's shards over; "
@@ -207,8 +213,20 @@ def main():
                      daemon=True).start()
 
     d = Path(args.root) / args.stream
-    playlist = d / "live.m3u8"
+    slate_dir = Path(args.root) / "offline"
+    # The continuous playlist is generated per request, not stored: when
+    # nobody is broadcasting there is no live.m3u8 on disk at all. Reading
+    # the file would therefore relay nothing during exactly the period the
+    # slate exists to cover, so fetch the served playlist over HTTP instead.
+    # It is the one that splices slate and live into a single timeline whose
+    # sequence never rewinds.
+    pl_url = "%s/live/%s/index.m3u8" % (args.origin.rstrip("/"), args.stream)
     sent_names = collections.OrderedDict()   # origin name -> relay name
+    # The relay's own monotonic counter. Neither source can supply this: the
+    # encoder restarts at zero on every relaunch, and slate URIs rotate over
+    # a small set, so both would rewind a viewer's timeline and force the
+    # player to rebuild -- the stall this whole path exists to avoid.
+    next_seq = 0
     gen = 0
     last_pl = b""
 
@@ -218,29 +236,41 @@ def main():
             time.sleep(0.5)
             continue
         try:
-            body = playlist.read_bytes()
-        except OSError:
+            req = urllib.request.Request(pl_url)
+            req.add_header("User-Agent", "krsz-send/1")
+            req.add_header("Cache-Control", "no-cache")
+            f = urllib.request.urlopen(req, timeout=5)
+            try:
+                body = f.read()
+            finally:
+                f.close()
+        except Exception:
+            STATS["playlist_error"] += 1
             time.sleep(0.5)
             continue
 
         names = [l.strip() for l in body.decode("utf-8", "replace").splitlines()
-                 if l.strip() and not l.startswith("#") and not l.startswith("/")]
+                 if l.strip() and not l.startswith("#")]
         for name in names:
             if name in sent_names:
                 continue
-            path = d / name
+            # A slate entry is root-absolute and shared by every idle stream;
+            # a live one is relative to this stream's directory. Both must be
+            # relayed, or a viewer loses the picture whenever ingest pauses.
+            if name.startswith("/"):
+                path = slate_dir / "offline.ts"
+            else:
+                path = d / name
             try:
                 data = path.read_bytes()
             except OSError:
                 continue
             if not data:
                 continue
-            seq = segment_index(name)
-            if seq < 0:
-                continue
-            send_segment(sock, peers, args.stream_id, seq, data,
+            send_segment(sock, peers, args.stream_id, next_seq, data,
                          args.k, args.n, codec, args.pace)
-            sent_names[name] = "seg%05d.ts" % (seq % 100000)
+            sent_names[name] = "seg%05d.ts" % (next_seq % 100000)
+            next_seq += 1
             while len(sent_names) > 60:
                 sent_names.popitem(last=False)
 

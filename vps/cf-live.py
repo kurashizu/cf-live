@@ -22,7 +22,18 @@ import re
 import shutil
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    # Python 3.6 (Alibaba Cloud Linux 3 ships 3.6.8) predates
+    # ThreadingHTTPServer. Compose it exactly as 3.7+ does: a stalled viewer
+    # must not block ingest, and segments are served concurrently.
+    import socketserver
+
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 from pathlib import Path
 
 # Names that must never be treated as a stream, or a stream could shadow an
@@ -235,7 +246,7 @@ class Handler(BaseHTTPRequestHandler):
             st = SEQ_STATE.get(stream)
             if st is None:
                 st = {"seq": 0, "window": [], "live": False,
-                      "last_raw": "", "next_slate": 0.0}
+                      "last_raw": "", "next_slate": 0.0, "touched": now}
                 SEQ_STATE[stream] = st
                 # Start with a full window rather than one entry that grows
                 # over the next few seconds. A player handed a single 2s
@@ -246,8 +257,11 @@ class Handler(BaseHTTPRequestHandler):
                 # real time.
                 uri = f"/live/_offline.{CONFIG['slate_version']}"
                 for i in range(max(CONFIG["window"], 1)):
+                    # Discontinuity on each, for the same reason as below:
+                    # every slate entry is the same file, so its media
+                    # restarts at PTS 0 while the playlist advances.
                     st["window"].append(
-                        (f"{uri}.{i % SLATE_POSITIONS}.ts", dur, False))
+                        (f"{uri}.{i % SLATE_POSITIONS}.ts", dur, True))
                 st["next_slate"] = now
 
             fresh = self.live_segments(stream)
@@ -292,7 +306,12 @@ class Handler(BaseHTTPRequestHandler):
                     pos = st["seq"] + len(st["window"])
                     uri = (f"/live/_offline.{CONFIG['slate_version']}"
                            f".{pos % SLATE_POSITIONS}.ts")
-                    st["window"].append((uri, dur, st["live"] or not st["window"]))
+                    # Always a discontinuity, not just at the live->slate
+                    # seam: every slate fragment is the same file, so its
+                    # media restarts at PTS 0 while the playlist advances.
+                    # Without the marker a player treats the repeated
+                    # timestamps as already-buffered and stops advancing.
+                    st["window"].append((uri, dur, True))
                     st["live"] = False
                     st["last_raw"] = ""
                     st["next_slate"] = max(now, st["next_slate"]) + dur
@@ -305,6 +324,7 @@ class Handler(BaseHTTPRequestHandler):
             # A discontinuity that scrolled to the front of the window is
             # still meaningful, but one on the very first entry of a brand
             # new timeline is not — there is nothing before it to break from.
+            st["touched"] = now
             entries = list(st["window"])
             seq = st["seq"]
 
@@ -501,10 +521,16 @@ class Handler(BaseHTTPRequestHandler):
             f"#EXT-X-MEDIA-SEQUENCE:{seq}",
             f"#EXT-X-TARGETDURATION:{int(dur) or 1}",
         ]
-        for _ in range(CONFIG["slate_window"]):
+        for i in range(CONFIG["slate_window"]):
+            # A distinct URI per slot and a discontinuity before each: the
+            # slate is one file, so players would otherwise dedupe the
+            # repeated URI and, even given distinct ones, reject the
+            # repeated PTS as already buffered.
+            lines.append("#EXT-X-DISCONTINUITY")
             # Three decimals and the ", no desc" title are SRS's exact output.
             lines.append(f"#EXTINF:{dur:.3f}, no desc")
-            lines.append(f"/live/_offline.{CONFIG['slate_version']}.ts")
+            lines.append(f"/live/_offline.{CONFIG['slate_version']}"
+                         f".{(seq + i) % SLATE_POSITIONS}.ts")
         return "\n".join(lines) + "\n"
 
     def serve_segment(self, stream: str, name: str):
@@ -690,18 +716,24 @@ def reap_stale(root: Path, idle_seconds: int, interval: int = 60):
                 files = list(d.iterdir())
                 if not files:
                     d.rmdir()
-                    with SEQ_LOCK:
-                        SEQ_STATE.pop(d.name, None)
                     continue
                 newest = max(f.stat().st_mtime for f in files)
                 if time.time() - newest > idle_seconds:
                     shutil.rmtree(d, ignore_errors=True)
-                    # Drop the sequence state too, or it accumulates one
-                    # entry per stream name for the life of the process.
-                    # A stream reaped and later revived starts a fresh
-                    # timeline anyway, so there is nothing to preserve.
-                    with SEQ_LOCK:
-                        SEQ_STATE.pop(d.name, None)
+            # Timeline state is NOT dropped with the directory. An idle
+            # stream keeps serving the slate from that same timeline, so
+            # discarding it rewinds EXT-X-MEDIA-SEQUENCE to zero -- which a
+            # player reads as a different stream and answers by never
+            # loading another fragment. Measured: viewers stalled on the
+            # slate every time the reaper ran.
+            #
+            # Instead it expires on its own inactivity: nobody has asked for
+            # this stream in a long while, so no viewer's timeline can break.
+            cutoff = time.time() - max(idle_seconds * 4, 3600)
+            with SEQ_LOCK:
+                for name in [k for k, v in SEQ_STATE.items()
+                             if v.get("touched", 0) < cutoff]:
+                    SEQ_STATE.pop(name, None)
         except OSError:
             # A stream being written to concurrently can race us; next pass
             # will catch it.
