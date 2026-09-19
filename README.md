@@ -301,6 +301,26 @@ hunts is edge behaviour — a cached playlist freezing the stream, a cached
 slate hiding a broadcast that already started, a returning viewer handed
 segments that no longer exist.
 
+## Measuring end-to-end latency
+
+`scripts/clock-stream.sh` pushes a test pattern with Beijing and Sydney wall
+clocks burnt into every frame, so the delay can be read by comparing the
+picture against a clock beside the player rather than inferred from
+timestamps:
+
+```sh
+scripts/clock-stream.sh                                    # live.krsz.in, 30 min
+scripts/clock-stream.sh https://<host> <KEY> main 10       # explicit
+```
+
+Run it from the machine you would normally broadcast from: the clock is
+rendered at the encoder, so the absolute number only reflects your own
+uplink if the encoder is yours.
+
+`scripts/clock.py` renders the frames and is what the script pipes into
+ffmpeg. It is pure Python because ffmpeg's `drawtext` filter is missing from
+some builds, including this project's dev machine.
+
 ## Offline behaviour
 
 A stream with no live content serves a playable "OFFLINE / WAITING FOR STREAM"

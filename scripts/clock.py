@@ -117,6 +117,15 @@ def frame(now):
 
 
 def main():
+    # Raw frames on stdout are unreadable in a terminal, and piping them
+    # there by accident is a confusing way to find that out.
+    if sys.stdout.isatty():
+        sys.stderr.write(
+            "clock.py writes raw RGB frames to stdout; it does not stream "
+            "by itself.\n"
+            "Use scripts/clock-stream.sh to encode and push, or pipe this "
+            "into ffmpeg.\n")
+        return 1
     seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 600.0
     import time
     t_end = time.time() + seconds
@@ -139,4 +148,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
