@@ -174,6 +174,19 @@ def rewrite_playlist(body, mapping):
     return ("\n".join(out) + "\n").encode()
 
 
+def segment_stamp(directory, name):
+    """Identify which write of a segment name this is.
+
+    Slate entries are a pure function of their name, so they need none.
+    """
+    if name.startswith("/"):
+        return 0
+    try:
+        return (directory / name).stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/dev/shm/cf-live")
@@ -220,7 +233,13 @@ def main():
     # It is the one that splices slate and live into a single timeline whose
     # sequence never rewinds.
     pl_url = "%s/live/%s/index.m3u8" % (args.origin.rstrip("/"), args.stream)
-    sent_names = collections.OrderedDict()   # origin name -> relay name
+    # origin name -> (relay name, stamp). The stamp is the file's mtime for a
+    # live segment: ffmpeg renumbers from zero on every relaunch, so a name
+    # alone cannot say whether it is the segment already sent or a new one
+    # reusing the name. Going by name alone skipped the whole new run while
+    # its names were still remembered, and the playlist then mapped them back
+    # onto the old relay numbers -- viewers looped the previous broadcast.
+    sent_names = collections.OrderedDict()
     # The relay's own monotonic counter. Neither source can supply this: the
     # encoder restarts at zero on every relaunch, and slate URIs rotate over
     # a small set, so both would rewind a viewer's timeline and force the
@@ -260,7 +279,9 @@ def main():
                     break
                 except ValueError:
                     pass
-        pending = [n for n in names if n not in sent_names]
+        stamps = {n: segment_stamp(d, n) for n in names}
+        pending = [n for n in names
+                   if n not in sent_names or sent_names[n][1] != stamps[n]]
         for name in pending:
             # A slate entry is root-absolute and shared by every idle stream;
             # a live one is relative to this stream's directory. Both must be
@@ -295,12 +316,14 @@ def main():
             pace = min(args.pace, budget / max(len(pending), 1))
             send_segment(sock, peers, args.stream_id, next_seq, data,
                          args.k, args.n, codec, pace)
-            sent_names[name] = "seg%05d.ts" % (next_seq % 100000)
+            sent_names.pop(name, None)
+            sent_names[name] = ("seg%05d.ts" % (next_seq % 100000), stamps[name])
             next_seq += 1
             while len(sent_names) > 60:
                 sent_names.popitem(last=False)
 
-        new_pl = rewrite_playlist(body, sent_names)
+        new_pl = rewrite_playlist(
+            body, {n: v[0] for n, v in sent_names.items()})
         if new_pl != last_pl:
             gen += 1
             send_manifest(sock, peers, args.stream_id, gen, new_pl)
