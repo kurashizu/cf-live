@@ -711,12 +711,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text("not found\n", 404)
             return
         ctype = "video/mp4" if name.endswith(".mp4") else TS_TYPE
-        # Segments are immutable once written, so caching them is always safe
-        # — and it is what stops viewer count from being bounded by uplink
-        # bandwidth.
+        # A segment is immutable only until the encoder restarts: ffmpeg
+        # renumbers from seg00000, so the same URL then names different
+        # content. An edge cache holding the old one for the full TTL serves
+        # the previous broadcast into the new one, which looks like viewers
+        # looping stale footage no matter what is pushed. Keep the TTL short
+        # (and never claim "immutable") so a cached copy cannot outlive a
+        # restart; it only needs to absorb a burst of viewers on one segment.
         cache = ("public, max-age=60"
                  if name.endswith(".mp4")
-                 else f"public, max-age={CONFIG['segment_ttl']}, immutable")
+                 else f"public, max-age={CONFIG['segment_ttl']}")
         self.send_file(path, ctype, cache)
 
     def serve_status(self, stream: str):
@@ -952,10 +956,11 @@ def main():
                     help="directory holding index.html")
     ap.add_argument("--key", default=os.environ.get("INGEST_KEY", ""),
                     help="ingest key; also read from INGEST_KEY")
-    ap.add_argument("--segment-ttl", type=int, default=3600,
-                    help="edge cache lifetime for segments; they are immutable, "
-                         "so this only bounds how long a cached copy survives "
-                         "after falling out of the playlist")
+    ap.add_argument("--segment-ttl", type=int, default=5,
+                    help="edge cache lifetime for segments. Must stay shorter "
+                         "than an encoder restart: names are reused from "
+                         "seg00000, so a long TTL replays the previous "
+                         "broadcast's segments into the new one")
     ap.add_argument("--keep-segments", type=int, default=12,
                     help="segments retained per stream. Must exceed --window "
                          "so a segment the playlist still references is never "
