@@ -218,6 +218,16 @@ doing, live (2 s refresh). The password is the ingest key.
 - **FEC tunnel**: loss, FEC headroom, segment recovery time and failures,
   measured at the receiver, plus the sender's rate and counters.
 
+- **History**: a viewer silent for 30 s has left, and its session (entry point,
+  address, player, start, end, counts, data) moves to a history you can filter
+  by time, entry point and text, with the peak concurrent viewers and a chart.
+  Sessions from the China relay arrive in its telemetry, repeated each time and
+  de-duplicated by id, so the lossy tunnel cannot drop one. Pass
+  `--history-file` to keep history across restarts (JSON lines, append-only,
+  deleted after `--history-days`, default 30, since it holds visitors'
+  addresses). Sessions still open are checkpointed every 10 s, so a restart
+  loses at most the last few seconds of them.
+
 Needs `cf-live.py` (not the nginx setup). The China box's half travels back
 over the same UDP tunnel as the media, never over TCP across the border: the
 receiver signs a snapshot every 2 s and sends it to the sender, which verifies

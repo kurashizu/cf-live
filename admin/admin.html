@@ -96,7 +96,7 @@
 
     <h2>Viewer list</h2>
     <div class="toolbar">
-      <label><input type="checkbox" id="only-active" checked> active only (last 15 s)</label>
+      <label><input type="checkbox" id="only-active" checked> active only (silent viewers go idle after 15 s and leave after 30 s)</label>
       <label><input type="checkbox" id="hide-internal" checked> hide internal polling</label>
       <span id="count"></span>
     </div>
@@ -112,6 +112,36 @@
     <p class="note">Presence is judged by playlist polls: Cloudflare caches segments, so a viewer behind it
       may reach the origin only for the playlist and its segment count is understated. Rate is computed in
       this page from successive readings.</p>
+
+    <h2>History · viewers who have left</h2>
+    <div class="toolbar">
+      <select id="h-range">
+        <option value="3600">last hour</option>
+        <option value="21600">last 6 hours</option>
+        <option value="86400" selected>last 24 hours</option>
+        <option value="604800">last 7 days</option>
+        <option value="0">everything kept</option>
+      </select>
+      <select id="h-entry">
+        <option value="">all entries</option>
+        <option value="cloudflare">Cloudflare</option>
+        <option value="http-80">China node · HTTP</option>
+        <option value="https-9999">China node · HTTPS</option>
+        <option value="direct">Direct</option>
+      </select>
+      <input id="h-filter" type="search" placeholder="Filter by IP, client or region" size="30">
+      <span id="h-count"></span>
+    </div>
+    <div class="grid" id="h-cards"></div>
+    <div class="tablewrap" style="margin-top:.8rem"><table>
+      <thead><tr>
+        <th>Entry</th><th>IP</th><th>Region</th><th>Client</th><th>Stream</th>
+        <th>Started</th><th>Left</th><th class="num">Watched</th>
+        <th class="num">Playlists</th><th class="num">Segments</th><th class="num">Total</th>
+      </tr></thead>
+      <tbody id="h-rows"></tbody>
+    </table></div>
+    <p class="note" id="h-note"></p>
   </main>
 </div>
 
@@ -126,6 +156,7 @@ const POLL_MS = 2000;
 const HIST = 60;
 let key = '';
 let timer = null;
+let histTimer = null;
 let paused = false;
 const prevBytes = new Map();    // row key -> [bytes, t]
 const rateOf = new Map();       // row key -> bps, last computed
@@ -409,6 +440,118 @@ function render(data) {
   renderRows(data);
 }
 
+/* ---------- history ---------- */
+let histData = null;
+let liveNow = [];          // viewers currently in a session, for the right edge of the chart
+
+function stamp(epoch) {
+  const d = new Date(epoch * 1000);
+  const same = new Date().toDateString() === d.toDateString();
+  return same ? d.toLocaleTimeString() : d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+}
+
+/* Distinct addresses watching in each time bucket: a session counts in every
+   bucket it overlaps, so the line is how many people were there, not how many
+   arrived. */
+function concurrency(sessions, from, to, buckets) {
+  const size = (to - from) / buckets;
+  const sets = Array.from({ length: buckets }, () => new Set());
+  for (const s of sessions) {
+    const a = Math.max(0, Math.floor((s.first - from) / size));
+    const b = Math.min(buckets - 1, Math.floor((s.last - from) / size));
+    for (let i = a; i <= b; i++) sets[i].add(s.ip);
+  }
+  return sets.map((x) => x.size);
+}
+
+/* The exact busiest moment, from session starts and ends rather than from
+   chart buckets (which can be many minutes wide). Distinct addresses, so one
+   person on two entry points counts once. */
+function peakMoment(sessions) {
+  const ev = [];
+  for (const s of sessions) { ev.push([s.first, 1, s.ip]); ev.push([s.last, -1, s.ip]); }
+  ev.sort((a, b) => a[0] - b[0] || b[1] - a[1]);      // starts before ends at the same instant
+  const open = new Map();
+  let best = 0, at = null;
+  for (const [t, d, ip] of ev) {
+    const n = (open.get(ip) || 0) + d;
+    if (n > 0) open.set(ip, n); else open.delete(ip);
+    if (open.size > best) { best = open.size; at = t; }
+  }
+  return { peak: best, at };
+}
+
+function renderHistory() {
+  if (!histData) return;
+  const range = Number($('h-range').value);
+  const entryF = $('h-entry').value;
+  const text = $('h-filter').value.trim().toLowerCase();
+  const now = histData.now;
+  const from = range ? now - range : Math.min(now - 3600, ...histData.sessions.map((s) => s.first));
+  let rows = histData.sessions.filter((s) => s.last >= from);
+  if (entryF) rows = rows.filter((s) => (entryF === 'cloudflare' ? s.source === 'cloudflare'
+    : entryF === 'direct' ? s.source === 'direct' : s.via === entryF));
+  if (text) rows = rows.filter((s) => [s.ip, s.ua, uaLabel(s.ua), s.country, s.colo, s.stream]
+    .join(' ').toLowerCase().includes(text));
+
+  const cards = $('h-cards');
+  cards.textContent = '';
+  const ips = new Set(rows.map((s) => s.ip));
+  const total = rows.reduce((n, s) => n + (s.last - s.first), 0);
+  const BUCKETS = 60;
+  const series = concurrency(rows, from, now, BUCKETS);
+  const { peak, at: peakAt } = peakMoment(rows);
+  cards.appendChild(card('Sessions', String(rows.length), 'ended in this range'));
+  cards.appendChild(card('Distinct IPs', String(ips.size), 'across those sessions'));
+  cards.appendChild(card('Average watch', rows.length ? dur(total / rows.length) : '—',
+    rows.length ? 'longest ' + dur(Math.max(...rows.map((s) => s.last - s.first))) : ''));
+  const chart = el('div', {}, [spark(series, 0, Math.max(peak, 1))]);
+  cards.appendChild(card('Peak concurrent', String(peak),
+    peakAt ? 'at ' + stamp(peakAt) : 'no viewers in range', peak ? 'ok' : '', chart, true));
+
+  const body = $('h-rows');
+  body.textContent = '';
+  const SHOW = 300;
+  for (const s of rows.slice(0, SHOW)) {
+    const e = entry(s);
+    const region = s.source === 'cloudflare' ? [s.country, s.colo ? 'edge ' + s.colo : ''].filter(Boolean).join(' · ') : '';
+    body.appendChild(el('tr', {}, [
+      el('td', {}, [el('span', { class: 'badge ' + e.cls, text: e.text })]),
+      el('td', { text: s.ip }),
+      el('td', { text: region || '—' }),
+      el('td', { class: 'ua', title: s.ua, text: uaLabel(s.ua) }),
+      el('td', { text: s.stream || '—' }),
+      el('td', { text: stamp(s.first) }),
+      el('td', { text: stamp(s.last) + ' (' + dur(now - s.last) + ' ago)' }),
+      el('td', { class: 'num', text: dur(s.last - s.first) }),
+      el('td', { class: 'num', text: String(s.playlists) }),
+      el('td', { class: 'num', text: String(s.segments) }),
+      el('td', { class: 'num', text: bytes(s.bytes) }),
+    ]));
+  }
+  if (!rows.length) {
+    const td = el('td', { colspan: '11', text: 'No sessions match.' });
+    td.style.textAlign = 'center'; td.style.color = 'var(--mut)';
+    body.appendChild(el('tr', {}, [td]));
+  }
+  $('h-count').textContent = rows.length > SHOW ? 'showing newest ' + SHOW + ' of ' + rows.length : rows.length + ' shown';
+  $('h-note').textContent = (histData.persistent
+    ? 'Kept on the origin for ' + histData.retention_days + ' days, then deleted. '
+    : 'Not saved to disk: this history is lost when the origin restarts. ') +
+    histData.total + ' sessions stored. A viewer silent for 30 s has left; coming back starts a new session. ' +
+    'A restart of the origin ends sessions in progress (the last ~10 s of those may be missing), so one viewing can appear as two rows.';
+}
+
+async function pollHistory() {
+  if (paused) return;
+  try {
+    const res = await fetch('/admin/api/history?limit=2000', { headers: { 'X-Admin-Key': key }, cache: 'no-store' });
+    if (!res.ok) return;
+    histData = await res.json();
+    renderHistory();
+  } catch (e) { /* the live poll reports connectivity */ }
+}
+
 /* ---------- polling and sign-in ---------- */
 async function poll() {
   if (paused) return;
@@ -429,11 +572,16 @@ function signIn(k) {
   $('login').classList.add('hidden');
   $('app').classList.remove('hidden');
   poll();
+  pollHistory();
   clearInterval(timer);
   timer = setInterval(poll, POLL_MS);
+  clearInterval(histTimer);
+  histTimer = setInterval(pollHistory, 10000);
 }
 function signOut(msg) {
   clearInterval(timer);
+  clearInterval(histTimer);
+  histData = null;
   key = '';
   try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* ignore */ }
   $('app').classList.add('hidden');
@@ -452,6 +600,8 @@ $('pause').addEventListener('click', () => {
   if (!paused) poll();
 });
 ['only-active', 'hide-internal'].forEach((id) => $(id).addEventListener('change', () => last && renderRows(last)));
+['h-range', 'h-entry'].forEach((id) => $(id).addEventListener('change', renderHistory));
+$('h-filter').addEventListener('input', renderHistory);
 
 try { const saved = sessionStorage.getItem(KEY_STORE); if (saved) signIn(saved); } catch (e) { /* ignore */ }
 </script>

@@ -79,7 +79,8 @@ check(t["headroom"] is not None and t["headroom"] <= 0, "headroom is exhausted (
 print("-- telemetry snapshot")
 check(recv.CONFIG["stats_secret"] == b"", "telemetry is off until a secret is configured")
 snap = recv.telemetry_snapshot()
-check(set(snap) == {"viewers", "tunnel", "node"}, "snapshot carries viewers, tunnel and node")
+check(set(snap) == {"viewers", "closed", "tunnel", "node"},
+      "snapshot carries viewers, closed sessions, tunnel and node")
 check(snap["tunnel"]["headroom"] is not None or snap["tunnel"]["segments_judged"] == 0,
       "snapshot includes the tunnel figures")
 

@@ -499,6 +499,9 @@ def telemetry_snapshot():
     _pps, udp_bps = STATE["rate"].rate()
     return {
         "viewers": VIEWERS.snapshot()[:150],
+        # Repeated every time, not "what is new": the tunnel loses some
+        # snapshots, and the origin de-duplicates by id.
+        "closed": VIEWERS.closed_snapshot(),
         "tunnel": tunnel_overview(),
         "node": {"nic": NET.rates(), "load": host_load(),
                  "app": {"udp_rx_bps": round(udp_bps),

@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import time
+from urllib.parse import parse_qs, urlparse
 import math
 import hmac
 import os
@@ -44,9 +45,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from sysstats import NetMeter, RateMeter, host_load  # noqa: E402
+from history import HistoryStore, from_local, from_telemetry  # noqa: E402
 from viewers import FailureLimiter, ViewerLog  # noqa: E402
 
 VIEWERS = ViewerLog()
+HISTORY = HistoryStore(None)      # replaced in main() when a file is configured
 ADMIN_FAILS = FailureLimiter()
 NET = NetMeter()
 INGEST = RateMeter()          # the encoder pushing in
@@ -221,6 +224,34 @@ def stream_dir(stream: str) -> Path:
     return Path(CONFIG["root"]) / stream
 
 
+def history_loop():
+    """Move closed sessions into history, whether or not anyone is looking.
+
+    The origin's own viewers close inside VIEWERS; the China relay's arrive in
+    its telemetry (repeated each time, de-duplicated by id). Sessions still
+    open are checkpointed so a restart does not lose them.
+    """
+    seen_at = None
+    last_ck = last_prune = 0.0
+    while True:
+        time.sleep(5)
+        try:
+            HISTORY.add(from_local(VIEWERS.drain_closed()))
+            cn = read_receiver_stats()
+            if cn is not None and cn.get("received_at") != seen_at:
+                seen_at = cn.get("received_at")
+                HISTORY.add(from_telemetry(cn.get("closed", []), seen_at))
+            now = time.time()
+            if now - last_ck >= 10:
+                last_ck = now
+                HISTORY.checkpoint(VIEWERS.export_live(), "origin")
+            if now - last_prune >= 3600:
+                last_prune = now
+                HISTORY.prune()
+        except Exception as exc:       # a bad file must not end the collector
+            sys.stderr.write("history: %r\n" % (exc,))
+
+
 def read_sender_stats():
     """The relay sender's counters, which it publishes as a file each second.
 
@@ -344,6 +375,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/api/viewers":
             self.serve_admin_viewers()
             return
+        if path == "/admin/api/history":
+            self.serve_admin_history()
+            return
 
         if path in ("/healthz", "/health"):
             self.send_text("ok\n")
@@ -433,8 +467,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text("not found\n", 404)
 
     # ---- admin -----------------------------------------------------------
-    def serve_admin_viewers(self):
-        """Every viewer on every entry point, for the admin page.
+    def admin_gate(self):
+        """The given password if it is right; otherwise answers and returns None.
 
         The password is the ingest key. It travels as a header, never in the
         URL, and repeated misses lock the client out for a minute.
@@ -442,14 +476,41 @@ class Handler(BaseHTTPRequestHandler):
         who = self.client_info()["ip"]
         if ADMIN_FAILS.blocked(who):
             self.send_text("too many attempts\n", 429)
-            return
+            return None
         given = (self.headers.get("X-Admin-Key") or "").encode()
         if not hmac.compare_digest(given, CONFIG["key"].encode()):
             ADMIN_FAILS.fail(who)
             time.sleep(0.4)              # blunt a guessing loop
             self.send_text("forbidden\n", 403)
-            return
+            return None
+        return given.decode()
 
+    def serve_admin_history(self):
+        """Viewers who have left, newest first, for looking back."""
+        if self.admin_gate() is None:
+            return
+        q = parse_qs(urlparse(self.path).query)
+
+        def num(name, default, lo, hi):
+            try:
+                return max(lo, min(hi, float(q.get(name, [default])[0])))
+            except ValueError:
+                return default
+        limit = int(num("limit", 500, 1, 2000))
+        since = num("since", 0, 0, 4e9) or None
+        body = json.dumps({
+            "sessions": HISTORY.query(limit=limit, since=since),
+            "total": len(HISTORY),
+            "retention_days": CONFIG["history_days"],
+            "persistent": bool(CONFIG["history_file"]),
+            "now": time.time(),
+        }).encode()
+        self.send_body(body, "application/json", "no-store")
+
+    def serve_admin_viewers(self):
+        """Every viewer on every entry point, for the admin page."""
+        if self.admin_gate() is None:
+            return
         viewers = [dict(v, server="origin") for v in VIEWERS.snapshot()]
         servers = {"origin": {"ok": True}}
         _, ingest_bps = INGEST.rate()
@@ -1135,6 +1196,12 @@ def main():
     ap.add_argument("--stale-after", type=float, default=1.0,
                     help="serve the offline slate once ingest has been idle "
                          "this many seconds (0 disables)")
+    ap.add_argument("--history-file", default="",
+                    help="where closed viewer sessions are kept (JSON lines); "
+                         "empty keeps them in memory only")
+    ap.add_argument("--history-days", type=float, default=30.0,
+                    help="forget sessions, and the addresses in them, after "
+                         "this many days")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -1161,6 +1228,12 @@ def main():
         print(f"  WARNING: no slate at {slate}", flush=True)
 
     NET.start()
+    global HISTORY
+    HISTORY = HistoryStore(args.history_file, keep_days=args.history_days)
+    recovered = HISTORY.recover()
+    if recovered:
+        print(f"  history: recovered {recovered} open session(s) from the last run", flush=True)
+    threading.Thread(target=history_loop, daemon=True).start()
     if args.reap_after > 0:
         threading.Thread(
             target=reap_stale, args=(Path(args.root), args.reap_after),
