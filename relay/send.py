@@ -32,10 +32,15 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "shared"))
+import binascii
+import telemetry
 import wire
 from rs import Codec
 from sysstats import RateMeter
 
+# Telemetry the receiver sends back through the pinhole: verified, then
+# published as a file for the origin, like this process's own counters.
+TELEM = {"secret": b"", "path": "", "asm": telemetry.Reassembler()}
 TX = RateMeter()    # UDP leaving for the receiver
 PEERS = {}          # addr -> last HELLO time
 PEERS_LOCK = threading.Lock()
@@ -51,6 +56,9 @@ def hello_listener(sock, stream_id, ttl):
             time.sleep(0.1)
             continue
         ptype, off = wire.parse_header(buf)
+        if ptype == wire.STATS:
+            on_stats(buf, off, stream_id)
+            continue
         if ptype != wire.HELLO:
             continue
         p = wire.unpack_hello(buf, off)
@@ -62,6 +70,38 @@ def hello_listener(sock, stream_id, ttl):
         if new:
             print("peer joined %s:%d" % addr, flush=True)
         STATS["hellos"] += 1
+
+
+def on_stats(buf, off, stream_id):
+    """One piece of the receiver's telemetry snapshot.
+
+    This port is open to the internet, so nothing is believed until the whole
+    snapshot passes its HMAC: a forged or replayed one is counted and dropped.
+    """
+    if not TELEM["secret"]:
+        return
+    try:
+        p = wire.unpack_stats(buf, off)
+    except Exception:
+        return
+    if p["stream_id"] != stream_id:
+        return
+    blob = TELEM["asm"].add(p["generation"], p["total"], p["offset"], p["chunk"])
+    if blob is None:
+        return
+    doc = telemetry.open_sealed(blob, TELEM["secret"])
+    if doc is None:
+        STATS["telemetry_rejected"] += 1
+        return
+    STATS["telemetry_ok"] += 1
+    doc["received_at"] = time.time()
+    tmp = TELEM["path"] + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(doc, f)
+        os.replace(tmp, TELEM["path"])
+    except OSError:
+        STATS["telemetry_write_error"] += 1
 
 
 def live_peers(ttl):
@@ -239,6 +279,10 @@ def main():
                     help="where to read the continuous playlist from; the "
                          "local relay, not the public hostname")
     ap.add_argument("--peer-ttl", type=float, default=15.0)
+    ap.add_argument("--stats-secret", default=os.environ.get("KRSZ_STATS_SECRET", ""),
+                    help="hex secret that authenticates telemetry from the "
+                         "receiver (also read from KRSZ_STATS_SECRET); "
+                         "empty ignores it")
     ap.add_argument("--stats-file", default="",
                     help="where to publish counters for the admin page "
                          "(default: <root>/relay-sender.json)")
@@ -252,6 +296,9 @@ def main():
 
     codec = Codec(args.k, args.n)
     stats_path = args.stats_file or str(Path(args.root) / "relay-sender.json")
+    secret = args.stats_secret.strip()
+    TELEM["secret"] = binascii.unhexlify(secret) if secret else b""
+    TELEM["path"] = str(Path(args.root) / "relay-receiver.json")
     started = time.time()
     last_stats = 0.0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

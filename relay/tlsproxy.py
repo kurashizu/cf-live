@@ -72,9 +72,8 @@ class Proxy(socketserver.StreamRequestHandler):
             body = self.rfile.read(int(n))
 
         # Identity headers are set here, never passed through: a viewer could
-        # otherwise claim any address, or claim to have arrived over HTTPS,
-        # which is what the relay's admin API trusts to decide the password
-        # never crossed a cleartext hop.
+        # otherwise claim any address or entry point, and the admin page
+        # would list the forgery as fact.
         spoofable = {"x-real-ip", "x-forwarded-for", "x-krsz-via"}
         fwd = {k: v for k, v in headers.items()
                if k.lower() not in HOP_BY_HOP and k.lower() != "host"

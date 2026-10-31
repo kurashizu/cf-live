@@ -21,8 +21,7 @@ waiting for it would stall the stream.
 
 import argparse
 import collections
-import hashlib
-import hmac
+import binascii
 import json
 import math
 import os
@@ -53,15 +52,15 @@ import wire
 from page import PAGE
 from rs import Codec
 from sysstats import NetMeter, RateMeter, host_load
-from viewers import FailureLimiter, ViewerLog
+import telemetry
+from viewers import ViewerLog
 
 M3U8 = "application/vnd.apple.mpegurl"
 TS_TYPE = "video/MP2T"
 
-CONFIG = {"window": 3, "admin_hash": "", "admin_via": "https-9999"}
+CONFIG = {"window": 3, "stats_secret": b""}
 
 VIEWERS = ViewerLog()
-ADMIN_FAILS = FailureLimiter()
 NET = NetMeter()
 
 # Offset applied to the published media sequence so it never decreases, even
@@ -240,6 +239,8 @@ def receiver_loop(args):
     manifest_parts = {}
     manifest_gen = -1
     last_hello = 0.0
+    last_stats = 0.0
+    stats_gen = 0
     highest_seq = 0
 
     print("receiver: %s:%d -> serving on :%d" %
@@ -255,6 +256,23 @@ def receiver_loop(args):
             except OSError:
                 pass
             last_hello = now
+
+        # Telemetry goes back over the tunnel's own pinhole, not a TCP
+        # connection across the border. Each piece is sent twice, as
+        # playlists are, because a snapshot is useless unless all of it lands
+        # and the next one is only seconds away.
+        if CONFIG["stats_secret"] and now - last_stats >= args.stats_interval:
+            last_stats = now
+            try:
+                blob = telemetry.seal(telemetry_snapshot(), CONFIG["stats_secret"])
+                stats_gen += 1
+                for off, piece in telemetry.chunks(blob, wire.SHARD_PAYLOAD):
+                    pkt = wire.pack_stats(args.stream_id, stats_gen,
+                                          len(blob), off, piece)
+                    sock.sendto(pkt, dst)
+                    sock.sendto(pkt, dst)
+            except Exception:
+                STATE["stats"]["telemetry_error"] += 1
 
         try:
             buf, addr = sock.recvfrom(65535)
@@ -475,6 +493,19 @@ def tunnel_overview():
     }
 
 
+def telemetry_snapshot():
+    """Everything the admin page wants from this side, in one document."""
+    _pps, http_bps = STATE["http_tx"].rate()
+    _pps, udp_bps = STATE["rate"].rate()
+    return {
+        "viewers": VIEWERS.snapshot()[:150],
+        "tunnel": tunnel_overview(),
+        "node": {"nic": NET.rates(), "load": host_load(),
+                 "app": {"udp_rx_bps": round(udp_bps),
+                         "http_tx_bps": round(http_bps)}},
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -505,39 +536,6 @@ class Handler(BaseHTTPRequestHandler):
         the header cannot be forged by a viewer."""
         return self.headers.get("X-Real-IP") or self.client_address[0]
 
-    def admin_overview(self):
-        h = CONFIG["admin_hash"]
-        if not h:
-            self.fail(404)
-            return
-        # Over TLS only. The key rides in a header and must never cross the
-        # open internet; tlsproxy stamps this and nginx overwrites any claim.
-        if self.headers.get("X-Krsz-Via") != CONFIG["admin_via"]:
-            self.fail(403, "admin is https only\n")
-            return
-        who = self.client_ip()
-        if ADMIN_FAILS.blocked(who):
-            self.fail(429, "too many attempts\n")
-            return
-        given = hashlib.sha256(
-            (self.headers.get("X-Admin-Key") or "").encode()).hexdigest()
-        if not hmac.compare_digest(given, h):
-            ADMIN_FAILS.fail(who)
-            time.sleep(0.4)
-            self.fail(403, "forbidden\n")
-            return
-        net = NET.rates()
-        _pps, http_bps = STATE["http_tx"].rate()
-        pps, udp_bps = STATE["rate"].rate()
-        body = json.dumps({
-            "viewers": VIEWERS.snapshot(),
-            "tunnel": tunnel_overview(),
-            "node": {"nic": net, "load": host_load(),
-                     "app": {"udp_rx_bps": round(udp_bps),
-                             "http_tx_bps": round(http_bps)}},
-        }).encode()
-        self.send_payload(body, "application/json", "no-store")
-
     def fail(self, code, text="not found\n"):
         b = text.encode()
         self.send_response(code)
@@ -555,9 +553,6 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         self._track = None      # a kept-alive connection reuses this object
 
-        if path == "/admin/overview":
-            self.admin_overview()
-            return
 
         if path in ("/healthz", "/health"):
             self.send_payload(b"ok\n", "text/plain", "no-store")
@@ -634,19 +629,18 @@ def main():
     ap.add_argument("--hello-interval", type=float, default=2.0,
                     help="pinhole refresh; must stay below the security "
                          "group's UDP idle timeout")
-    ap.add_argument("--admin-key-sha256", default="",
-                    help="SHA-256 of the admin password, hex. Only the hash "
-                         "is kept here, so this box never holds the ingest "
-                         "key itself; empty disables the admin API")
-    ap.add_argument("--admin-via", default="https-9999",
-                    help="the X-Krsz-Via value that tlsproxy stamps; the admin "
-                         "API answers only requests carrying it (tlsproxy names "
-                         "it https-<its listen port>)")
+    ap.add_argument("--stats-secret", default=os.environ.get("KRSZ_STATS_SECRET", ""),
+                    help="hex secret that signs telemetry sent back to the "
+                         "sender (also read from KRSZ_STATS_SECRET). Derived "
+                         "from the ingest key, so this box never holds the key; "
+                         "empty disables telemetry")
+    ap.add_argument("--stats-interval", type=float, default=2.0,
+                    help="seconds between telemetry snapshots")
     args = ap.parse_args()
 
     CONFIG["window"] = args.window
-    CONFIG["admin_via"] = args.admin_via
-    CONFIG["admin_hash"] = args.admin_key_sha256.strip().lower()
+    secret = args.stats_secret.strip()
+    CONFIG["stats_secret"] = binascii.unhexlify(secret) if secret else b""
     NET.start()
 
     t = threading.Thread(target=receiver_loop, args=(args,), daemon=True)

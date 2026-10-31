@@ -18,7 +18,6 @@ import argparse
 import hashlib
 import json
 import time
-import urllib.request
 import math
 import hmac
 import os
@@ -222,10 +221,6 @@ def stream_dir(stream: str) -> Path:
     return Path(CONFIG["root"]) / stream
 
 
-_CN_CACHE = {"at": 0.0, "result": None}
-_CN_LOCK = threading.Lock()
-
-
 def read_sender_stats():
     """The relay sender's counters, which it publishes as a file each second.
 
@@ -240,30 +235,18 @@ def read_sender_stats():
     return doc
 
 
-def fetch_cn_viewers(url: str, key: str) -> dict:
-    """Ask the China relay who is on it.
+def read_receiver_stats():
+    """The China receiver's telemetry, as verified and saved by the sender.
 
-    Held for 1.5 s so an admin page polling every 2 s (or several of them)
-    costs the relay at most one request per poll, over a link that is slow
-    and lossy. The relay only answers over HTTPS, so the key is never sent in
-    the clear, and it stores only a hash of it.
+    It arrives over the UDP tunnel, so a quiet tunnel shows up as an old
+    `age` here rather than as a failed connection.
     """
-    with _CN_LOCK:
-        now = time.time()
-        if _CN_CACHE["result"] is not None and now - _CN_CACHE["at"] < 1.5:
-            return _CN_CACHE["result"]
-        try:
-            req = urllib.request.Request(url, headers={
-                "X-Admin-Key": key, "User-Agent": "krsz-admin/1"})
-            with urllib.request.urlopen(req, timeout=4) as r:
-                data = json.loads(r.read().decode())
-            result = {"ok": True, "viewers": data.get("viewers", []),
-                      "tunnel": data.get("tunnel"), "node": data.get("node")}
-        except Exception as exc:
-            result = {"ok": False, "viewers": [],
-                      "error": type(exc).__name__}
-        _CN_CACHE.update(at=time.time(), result=result)
-        return result
+    try:
+        doc = json.loads((Path(CONFIG["root"]) / "relay-receiver.json").read_text())
+    except (OSError, ValueError):
+        return None
+    doc["age"] = round(time.time() - doc.get("received_at", 0), 1)
+    return doc
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -478,13 +461,16 @@ class Handler(BaseHTTPRequestHandler):
                     "egress_cf_bps": round(cf_bps),
                     "egress_local_bps": round(local_bps)}}}
         tunnel = {"sender": read_sender_stats(), "receiver": None}
-        cn_url = CONFIG.get("cn_admin_url")
-        if cn_url:
-            cn = fetch_cn_viewers(cn_url, given.decode())
-            servers["cn"] = {"ok": cn["ok"], "error": cn.get("error", "")}
+        cn = read_receiver_stats()
+        if cn is not None:
+            fresh = cn["age"] < 15
+            servers["cn"] = {"ok": fresh, "error": "" if fresh
+                             else "no telemetry for %ds" % cn["age"]}
             viewers += [dict(v, server="cn") for v in cn.get("viewers", [])]
             nodes["cn"] = cn.get("node")
             tunnel["receiver"] = cn.get("tunnel")
+        else:
+            servers["cn"] = {"ok": False, "error": "no telemetry yet"}
         body = json.dumps({"servers": servers, "viewers": viewers,
                            "nodes": nodes, "tunnel": tunnel}).encode()
         self.send_body(body, "application/json", "no-store")
@@ -1149,9 +1135,6 @@ def main():
     ap.add_argument("--stale-after", type=float, default=1.0,
                     help="serve the offline slate once ingest has been idle "
                          "this many seconds (0 disables)")
-    ap.add_argument("--cn-admin-url", default="",
-                    help="the China relay's /admin/overview URL (HTTPS), "
-                         "merged into the admin page; empty disables")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

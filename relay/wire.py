@@ -22,6 +22,7 @@ HELLO = 1      # receiver -> sender: open/refresh the pinhole
 SHARD = 2      # sender -> receiver: one FEC shard of one block
 MANIFEST = 3   # sender -> receiver: the playlist, small and sent whole
 BYE = 4        # sender -> receiver: stream ended
+STATS = 5      # receiver -> sender: a signed telemetry snapshot, in chunks
 
 # struct formats. Kept explicit rather than pickled: the two ends are
 # deployed separately and may not be updated together, so the format has to
@@ -100,6 +101,20 @@ def unpack_manifest(buf, off):
         "total": total, "offset": offset,
         "chunk": buf[off + _MANIFEST.size:],
     }
+
+
+# STATS shares MANIFEST's body layout (stream, generation, total, offset,
+# chunk): a snapshot is split across datagrams the same way a playlist is,
+# and each piece stands alone. The reassembled bytes are zlib JSON followed
+# by a 16-byte HMAC, checked by the sender -- its UDP port is open to the
+# internet, so an unsigned snapshot could be forged by anyone.
+def pack_stats(stream_id, generation, total, offset, chunk):
+    return (header(STATS)
+            + _MANIFEST.pack(stream_id, generation, total, offset) + chunk)
+
+
+def unpack_stats(buf, off):
+    return unpack_manifest(buf, off)
 
 
 def pack_hello(stream_id, nonce):

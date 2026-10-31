@@ -218,20 +218,22 @@ doing, live (2 s refresh). The password is the ingest key.
 - **FEC tunnel**: loss, FEC headroom, segment recovery time and failures,
   measured at the receiver, plus the sender's rate and counters.
 
-Needs `cf-live.py` (not the nginx setup) and, for the China node's half:
+Needs `cf-live.py` (not the nginx setup). The China box's half travels back
+over the same UDP tunnel as the media, never over TCP across the border: the
+receiver signs a snapshot every 2 s and sends it to the sender, which verifies
+it and saves `<root>/relay-receiver.json` for the origin to read. The signing
+secret is derived from the ingest key, so the China box never holds the key:
 
 ```sh
-# on the VPS: the China relay's admin URL, which answers over HTTPS only
-cf-live.py ... --cn-admin-url https://cn.live.krsz.in:9999/admin/overview
-
-# on the China box: only a hash of the key is stored there
-recv.py ... --admin-key-sha256 "$(printf %s "$KEY" | sha256sum | cut -d' ' -f1)"
+SECRET=$(python3 -c "import sys; sys.path.insert(0,'shared'); import telemetry; print(telemetry.derive_secret('$KEY').hex())")
+# give the same value to both ends, as KRSZ_STATS_SECRET (or --stats-secret)
 ```
 
-`shared/viewers.py` and `shared/sysstats.py` must sit next to `cf-live.py`,
-`send.py` and `recv.py` on each box. The sender publishes its counters to
-`<root>/relay-sender.json` once a second for the origin to read.
+`shared/*.py` and `relay/wire.py` must sit next to `cf-live.py`, `send.py` and
+`recv.py` on each box. The sender also publishes its own counters to
+`<root>/relay-sender.json` once a second.
 
-Everything shown from the network is rendered as text, never as HTML, and
-five wrong passwords a minute lock a client out.
+Everything shown from the network is rendered as text, never as HTML, five
+wrong passwords a minute lock a client out, and a snapshot that fails its
+signature (the sender's UDP port is open to the internet) is dropped.
 

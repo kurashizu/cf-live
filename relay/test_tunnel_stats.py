@@ -76,8 +76,12 @@ t = recv.tunnel_overview()
 check(t["segments_failed_pct"] > 50, "55%% loss fails most segments (got %s)" % t["segments_failed_pct"])
 check(t["headroom"] is not None and t["headroom"] <= 0, "headroom is exhausted (got %s)" % t["headroom"])
 
-print("-- admin gate")
-check(not recv.CONFIG["admin_hash"], "admin is off until a hash is configured")
+print("-- telemetry snapshot")
+check(recv.CONFIG["stats_secret"] == b"", "telemetry is off until a secret is configured")
+snap = recv.telemetry_snapshot()
+check(set(snap) == {"viewers", "tunnel", "node"}, "snapshot carries viewers, tunnel and node")
+check(snap["tunnel"]["headroom"] is not None or snap["tunnel"]["segments_judged"] == 0,
+      "snapshot includes the tunnel figures")
 
 print()
 print("%d failed" % len(fails) if fails else "all passed")
