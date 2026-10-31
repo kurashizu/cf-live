@@ -220,6 +220,14 @@ const html = ({ origin, segDur, playlistSize, maxSegs, estLatency }) => `<!docty
 
 <!-- ============ QUICK START ============ -->
 <h2>Quick start</h2>
+<div class="hint" style="margin-bottom:.8rem">
+  <b>Profile</b>
+  <select id="profile" onchange="saveProfile();render()">
+    <option value="stable">Stable — 1s segments, 1200 Kbps (recommended)</option>
+    <option value="fast">Low latency — 0.5s segments, 2500 Kbps</option>
+  </select>
+  &nbsp;<span id="profile-note" class="small muted"></span>
+</div>
 <div class="qs">
   <ol>
     <li>
@@ -310,7 +318,7 @@ insists on the extension.</p>
           <span class="small muted">own numeric field, not encoder settings</span></td>
       <td><div class="cfgval"><code id="f-gop"></code><button class="minicopy" data-copy="f-gop">Copy</button></div></td></tr>
   <tr><td>Video Bitrate</td>
-      <td><div class="cfgval"><code id="f-rate">2500</code><button class="minicopy" data-copy="f-rate">Copy</button></div></td></tr>
+      <td><div class="cfgval"><code id="f-rate"></code><button class="minicopy" data-copy="f-rate">Copy</button></div></td></tr>
   <tr><td>Video Encoder</td>
       <td><div class="cfgval"><code id="f-venc">libx264</code><button class="minicopy" data-copy="f-venc">Copy</button></div></td></tr>
   <tr><td>Video Encoder Settings</td>
@@ -322,12 +330,12 @@ insists on the extension.</p>
 <div class="note">
   <b>Keyframe interval is the setting that actually controls latency.</b>
   A segment can only be cut on a keyframe, so if keyframes are 8s apart,
-  <code>hls_time=${segDur}</code> is ignored and you get 8s segments — which is
-  what turns a ${segDur}s configuration into 20-30s of observed latency.
+  <code>hls_time</code> is ignored and you get 8s segments — which is
+  what turns a 1s configuration into 20-30s of observed latency.
   <br><br>
   OBS ships with <code>249</code> frames here. Set it to
-  <b>frame rate × ${segDur}</b>: <code>${Math.round(30 * segDur)}</code> at 30 fps,
-  <code>${Math.round(60 * segDur)}</code> at 60 fps. The dedicated
+  <b>frame rate × segment length</b>: <code id="note-gop30"></code> at 30 fps,
+  <code id="note-gop60"></code> at 60 fps. The dedicated
   <b>Keyframe interval</b> field wins over any <code>g=</code> in the encoder
   settings box, so setting it there alone has no effect.
 </div>
@@ -336,7 +344,7 @@ insists on the extension.</p>
 <summary>Recommended settings and an ffmpeg test <span class="sub">— encoder profile, verify without OBS</span></summary>
 <h3>Recommended settings</h3>
 <ul class="small">
-  <li><b>1280×720 @ 30 fps, 2500 Kbps.</b> VRChat screens are small; this looks fine
+  <li><b>1280×720 @ 30 fps</b>, bitrate per the profile above. VRChat screens are small; this looks fine
       and noticeably reduces stalling.</li>
   <li><b>AAC, 128 Kbps, 48 kHz, stereo.</b> AVPro can misbehave at other sample rates.</li>
   <li><b>H.264 <code>main</code> or <code>baseline</code> profile.</b> Quest builds do not
@@ -539,7 +547,18 @@ window. Push to <code>/ingest/&lt;KEY&gt;/room2/…</code> and play <code>/room2
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script>
 const ORIGIN = location.origin;
-const SEG_DUR = ${segDur};
+const PROFILES = {
+  stable: { seg: 1,   rate: 1200, note: 'Fewer requests per second and smaller bursts; measured steadier than 0.5s segments over a long-haul path. Latency is roughly 1s higher.' },
+  fast:   { seg: 0.5, rate: 2500, note: 'Lowest latency, but twice the requests and noticeably more stalls on a long-haul path.' },
+};
+const PROFILE_STORE = 'cf-live-profile';
+function profile() {
+  const el = document.getElementById('profile');
+  return PROFILES[el && el.value] || PROFILES.stable;
+}
+function saveProfile() {
+  try { localStorage.setItem(PROFILE_STORE, document.getElementById('profile').value); } catch {}
+}
 const KEY_STORE = 'cf-live-ingest-key';
 let hls = null, statusTimer = null, currentStream = null;
 
@@ -576,24 +595,24 @@ function segPattern(n, k) { return ORIGIN + '/ingest/' + k + '/' + n + '/seg%05d
 
 function muxerSettings(n, k) {
   return 'method=PUT http_persistent=1 ignore_io_errors=1 ' +
-         'hls_time=' + SEG_DUR + ' hls_list_size=6 ' +
+         'hls_time=' + profile().seg + ' hls_list_size=6 ' +
          'hls_flags=delete_segments+omit_endlist hls_segment_type=mpegts ' +
          'hls_segment_filename=' + segPattern(n, k);
 }
 function videoEncoderSettings() {
-  const g = 30 * SEG_DUR;
+  const g = 30 * profile().seg;
   return 'preset=veryfast tune=zerolatency profile=main bf=0 ' +
          'g=' + g + ' keyint_min=' + g + ' sc_threshold=0';
 }
 function ffmpegCommand(n, k) {
-  const g = 30 * SEG_DUR;
+  const g = 30 * profile().seg;
   return [
     'ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \\\\',
     '       -f lavfi -i sine=frequency=440 \\\\',
     '  -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -bf 0 \\\\',
-    '  -g ' + g + ' -keyint_min ' + g + ' -sc_threshold 0 -b:v 2500k -pix_fmt yuv420p \\\\',
+    '  -g ' + g + ' -keyint_min ' + g + ' -sc_threshold 0 -b:v ' + profile().rate + 'k -pix_fmt yuv420p \\\\',
     '  -c:a aac -b:a 128k -ar 48000 -ac 2 \\\\',
-    '  -f hls -hls_time ' + SEG_DUR + ' -hls_list_size 6 \\\\',
+    '  -f hls -hls_time ' + profile().seg + ' -hls_list_size 6 \\\\',
     '  -hls_flags delete_segments+omit_endlist -hls_segment_type mpegts \\\\',
     '  -method PUT -http_persistent 1 -ignore_io_errors 1 \\\\',
     '  -hls_segment_filename "' + segPattern(n, k) + '" \\\\',
@@ -624,8 +643,12 @@ function render() {
   setText('f-url', ingestUrl(n, k));
   setText('f-mux', muxerSettings(n, k));
   setText('f-vset', videoEncoderSettings());
-  setText('f-gop', String(30 * SEG_DUR));
-  setText('qs-gop', String(30 * SEG_DUR));
+  setText('f-gop', String(30 * profile().seg));
+  setText('qs-gop', String(30 * profile().seg));
+  setText('f-rate', String(profile().rate));
+  setText('note-gop30', String(30 * profile().seg));
+  setText('note-gop60', String(60 * profile().seg));
+  setText('profile-note', profile().note);
 
   setText('ov-bar', overlayUrl({ bar: 1, live: 1, clock: 1, tzlabel: 'SYD' }));
   setText('ov-full', overlayUrl({ live: 1, clock: 1, tzlabel: 'SYD' }));
@@ -889,6 +912,10 @@ async function startStatus(name) {
 try {
   const saved = localStorage.getItem(KEY_STORE);
   if (saved) document.getElementById('key').value = saved;
+} catch {}
+try {
+  const p = localStorage.getItem(PROFILE_STORE);
+  if (p && PROFILES[p]) document.getElementById('profile').value = p;
 } catch {}
 document.getElementById('key').addEventListener('input', () => { saveKey(); render(); });
 document.getElementById('stream').addEventListener('input', render);
