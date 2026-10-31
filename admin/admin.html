@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>KRSZ Live · Admin</title>
+<style>
+  :root { --bg:#0b0b0d; --panel:#141417; --line:#24242a; --fg:#e8e8ec; --mut:#8b8b96;
+          --acc:#ff8a1f; --ok:#3ecf6e; --warn:#f0b429; --bad:#f25555; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:1rem; padding:.8rem 1.2rem;
+           border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2; }
+  header h1 { font-size:1rem; margin:0; letter-spacing:.08em; }
+  header h1 b { color:var(--acc); }
+  .sp { flex:1; }
+  .pill { display:inline-flex; align-items:center; gap:.4rem; padding:.15rem .6rem;
+          border:1px solid var(--line); border-radius:999px; font-size:.8rem; color:var(--mut); }
+  .dot { width:.55rem; height:.55rem; border-radius:50%; background:var(--mut); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); } .dot.warn { background:var(--warn); }
+  button, input { font:inherit; color:inherit; background:var(--panel); border:1px solid var(--line);
+                  border-radius:6px; padding:.35rem .7rem; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  main { padding:1.2rem; max-width:1500px; margin:0 auto; }
+  h2 { font-size:.8rem; letter-spacing:.12em; text-transform:uppercase; color:var(--mut);
+       margin:1.6rem 0 .6rem; font-weight:600; }
+  .grid { display:grid; gap:.8rem; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:.8rem 1rem; }
+  .card .k { color:var(--mut); font-size:.75rem; text-transform:uppercase; letter-spacing:.06em; }
+  .card .v { font-size:1.5rem; font-weight:600; margin-top:.15rem; }
+  .card .s { color:var(--mut); font-size:.78rem; margin-top:.1rem; }
+  .v.ok { color:var(--ok); } .v.warn { color:var(--warn); } .v.bad { color:var(--bad); }
+  .wide { grid-column:span 2; }
+  .note { color:var(--mut); font-size:.78rem; margin:.4rem 0 0; }
+  svg.spark { width:100%; height:38px; display:block; margin-top:.3rem; }
+  svg.spark polyline { fill:none; stroke:var(--acc); stroke-width:1.5; vector-effect:non-scaling-stroke; }
+  svg.spark line { stroke:var(--line); stroke-width:1; vector-effect:non-scaling-stroke; }
+  .tablewrap { overflow:auto; border:1px solid var(--line); border-radius:10px; }
+  table { border-collapse:collapse; width:100%; min-width:1000px; }
+  th, td { text-align:left; padding:.45rem .7rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--mut); font-weight:600; font-size:.74rem; text-transform:uppercase; letter-spacing:.06em;
+       position:sticky; top:0; background:var(--panel); }
+  tr.idle td { opacity:.45; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td.ua { max-width:260px; overflow:hidden; text-overflow:ellipsis; }
+  .badge { display:inline-block; padding:.05rem .5rem; border-radius:5px; font-size:.75rem; border:1px solid var(--line); }
+  .b-cloudflare { color:#f6821f; border-color:#6b3a10; }
+  .b-cn { color:#4db3ff; border-color:#1c4466; }
+  .b-direct { color:var(--warn); border-color:#5c4710; }
+  .b-internal { color:var(--mut); }
+  .toolbar { display:flex; gap:1rem; align-items:center; margin:.4rem 0 .6rem; color:var(--mut); font-size:.85rem; flex-wrap:wrap; }
+  label { cursor:pointer; user-select:none; }
+  #login { max-width:340px; margin:18vh auto 0; text-align:center; }
+  #login input { width:100%; margin:.8rem 0 .5rem; }
+  #err { color:var(--bad); min-height:1.3em; font-size:.85rem; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <h1 style="letter-spacing:.08em">KRSZ <b style="color:var(--acc)">LIVE</b> · Admin</h1>
+  <input id="pw" type="password" placeholder="Admin password" autocomplete="current-password" autofocus>
+  <button id="go" style="width:100%">Sign in</button>
+  <div id="err"></div>
+  <div class="note">The password is your ingest key. It is sent only as a request header over HTTPS.</div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>KRSZ <b>LIVE</b> · Admin</h1>
+    <span class="pill"><span class="dot" id="d-origin"></span><span id="t-origin">origin</span></span>
+    <span class="pill"><span class="dot" id="d-cn"></span><span id="t-cn">China node</span></span>
+    <span class="sp"></span>
+    <span class="pill" id="updated">—</span>
+    <button id="pause">Pause</button>
+    <button id="logout">Sign out</button>
+  </header>
+  <main>
+    <h2>Viewers</h2>
+    <div class="grid" id="viewer-cards"></div>
+
+    <h2>Nodes · bandwidth</h2>
+    <div class="grid" id="node-cards"></div>
+    <p class="note">Cloudflare's own edge-to-viewer traffic is not visible from here. The origin only
+      sees what Cloudflare could not serve from its cache, so origin egress understates what viewers
+      behind Cloudflare actually pull.</p>
+
+    <h2>FEC tunnel · VPS → China</h2>
+    <div class="grid" id="tunnel-cards"></div>
+    <p class="note">Loss and headroom are measured at the receiver over the last ~60 segments, because the
+      sender has no feedback channel. Headroom is parity shards per block minus the most any one block lost:
+      how many more shards could have gone missing before a segment failed to decode.</p>
+
+    <h2>Viewer list</h2>
+    <div class="toolbar">
+      <label><input type="checkbox" id="only-active" checked> active only (last 15 s)</label>
+      <label><input type="checkbox" id="hide-internal" checked> hide internal polling</label>
+      <span id="count"></span>
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr>
+        <th>Entry</th><th>IP</th><th>Region</th><th>Client</th><th>Stream</th>
+        <th class="num">Seen</th><th class="num">Watching</th>
+        <th class="num">Playlists</th><th class="num">Segments</th>
+        <th class="num">Rate</th><th class="num">Total</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+    <p class="note">Presence is judged by playlist polls: Cloudflare caches segments, so a viewer behind it
+      may reach the origin only for the playlist and its segment count is understated. Rate is computed in
+      this page from successive readings.</p>
+  </main>
+</div>
+
+<script>
+'use strict';
+/* Everything shown from the network (IPs, user agents, stream names) is
+   attacker-controlled. It is only ever placed with textContent or setAttribute,
+   never parsed as HTML. */
+
+const KEY_STORE = 'krsz-admin-key';
+const POLL_MS = 2000;
+const HIST = 60;
+let key = '';
+let timer = null;
+let paused = false;
+const prevBytes = new Map();    // row key -> [bytes, t]
+const rateOf = new Map();       // row key -> bps, last computed
+const hist = { origin_tx: [], origin_rx: [], cn_tx: [], cn_rx: [], tunnel_loss: [] };
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, props, kids) {
+  const n = document.createElement(tag);
+  if (props) for (const k of Object.keys(props)) {
+    if (k === 'text') n.textContent = props[k];
+    else if (k === 'class') n.className = props[k];
+    else n.setAttribute(k, props[k]);
+  }
+  (kids || []).forEach((c) => n.appendChild(c));
+  return n;
+}
+
+/* ---------- formatting ---------- */
+function bps(v) {
+  if (v == null) return '—';
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + ' Gbit/s';
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + ' Mbit/s';
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + ' kbit/s';
+  return Math.round(v) + ' bit/s';
+}
+function bytes(v) {
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + ' GB';
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + ' MB';
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + ' kB';
+  return v + ' B';
+}
+function dur(s) {
+  s = Math.round(s);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  return Math.floor(s / 3600) + 'h ' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm';
+}
+function pct(v) { return v == null ? '—' : v.toFixed(v < 10 ? 2 : 1) + '%'; }
+
+function uaLabel(ua) {
+  if (!ua) return '(none)';
+  if (/krsz-(send|admin)/i.test(ua)) return 'KRSZ internal';
+  if (/ExoPlayer|Dalvik|okhttp/i.test(ua)) return 'Quest / Android (ExoPlayer)';
+  if (/AppleCoreMedia/i.test(ua)) return 'Apple (AVFoundation)';
+  if (/UnityPlayer|AVPro/i.test(ua)) return 'Unity / AVPro';
+  if (/NSPlayer|WMFSDK|Windows-Media/i.test(ua)) return 'Windows Media Foundation';
+  if (/Lavf|ffmpeg/i.test(ua)) return 'ffmpeg';
+  if (/VLC/i.test(ua)) return 'VLC';
+  if (/curl/i.test(ua)) return 'curl';
+  if (/Edg\//.test(ua)) return 'Browser (Edge)';
+  if (/Firefox\//.test(ua)) return 'Browser (Firefox)';
+  if (/Chrome\//.test(ua)) return 'Browser (Chrome)';
+  if (/Safari\//.test(ua)) return 'Browser (Safari)';
+  return ua.split(/[\s/]/)[0].slice(0, 24) || ua.slice(0, 24);
+}
+
+function entry(v) {
+  if (v.internal) return { cls: 'b-internal', text: 'Internal' };
+  if (v.source === 'cloudflare') return { cls: 'b-cloudflare', text: 'Cloudflare' };
+  if (v.source === 'cn') {
+    const via = v.via === 'https-9999' ? 'HTTPS' : v.via === 'http-80' ? 'HTTP' : v.via;
+    return { cls: 'b-cn', text: 'CN node · ' + via };
+  }
+  return { cls: 'b-direct', text: 'Direct' };
+}
+
+/* ---------- sparkline ---------- */
+function spark(values, lo, hi) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('class', 'spark');
+  svg.setAttribute('viewBox', '0 0 100 30');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  const base = document.createElementNS(ns, 'line');
+  base.setAttribute('x1', 0); base.setAttribute('x2', 100);
+  base.setAttribute('y1', 29.5); base.setAttribute('y2', 29.5);
+  svg.appendChild(base);
+  const pts = values.filter((v) => v != null);
+  if (pts.length > 1) {
+    const max = hi != null ? hi : Math.max(...pts, 1e-9);
+    const min = lo != null ? lo : 0;
+    const line = document.createElementNS(ns, 'polyline');
+    const n = values.length;
+    line.setAttribute('points', values.map((v, i) => {
+      const y = v == null ? 29 : 29 - ((v - min) / ((max - min) || 1)) * 27;
+      return (i / (n - 1) * 100).toFixed(2) + ',' + Math.max(1, Math.min(29, y)).toFixed(2);
+    }).join(' '));
+    svg.appendChild(line);
+  }
+  return svg;
+}
+
+function push(arr, v) { arr.push(v); if (arr.length > HIST) arr.shift(); }
+
+function card(k, v, s, cls, extra, wide) {
+  const kids = [el('div', { class: 'k', text: k }), el('div', { class: 'v' + (cls ? ' ' + cls : ''), text: v })];
+  if (s) kids.push(el('div', { class: 's', text: s }));
+  if (extra) kids.push(extra);
+  return el('div', { class: 'card' + (wide ? ' wide' : '') }, kids);
+}
+
+/* ---------- render ---------- */
+function renderViewers(data) {
+  const all = data.viewers || [];
+  const real = all.filter((v) => !v.internal);
+  const active = real.filter((v) => v.active);
+  const by = (f) => active.filter(f).length;
+  const cards = $('viewer-cards');
+  cards.textContent = '';
+  const ips = new Set(active.map((v) => v.ip)).size;
+  cards.appendChild(card('Watching now', String(ips), 'distinct IPs, active in the last 15 s', ips ? 'ok' : ''));
+  cards.appendChild(card('Via Cloudflare', String(by((v) => v.source === 'cloudflare')), 'live.krsz.in'));
+  cards.appendChild(card('Via China node · HTTP', String(by((v) => v.via === 'http-80')), 'bare IP, port 80'));
+  cards.appendChild(card('Via China node · HTTPS', String(by((v) => v.via === 'https-9999')), 'cn.live.krsz.in:9999'));
+  const direct = by((v) => v.source === 'direct');
+  if (direct) cards.appendChild(card('Direct to origin', String(direct), 'not through Cloudflare', 'warn'));
+}
+
+function nodeCard(name, sub, node, appRows, histKeys) {
+  if (!node) return card(name, 'unreachable', sub, 'bad');
+  const nic = node.nic || {};
+  const load = node.load || {};
+  const rows = el('div', { class: 's' });
+  const lines = [
+    '↓ ' + bps(nic.rx_bps) + '   ↑ ' + bps(nic.tx_bps),
+    'load ' + load.load1 + ' / ' + load.cpus + ' cpu' + (load.mem_used_pct != null ? ' · mem ' + load.mem_used_pct + '%' : ''),
+  ].concat(appRows);
+  lines.forEach((t) => rows.appendChild(el('div', { text: t })));
+  push(hist[histKeys[0]], nic.tx_bps || 0);
+  push(hist[histKeys[1]], nic.rx_bps || 0);
+  const both = hist[histKeys[0]].concat(hist[histKeys[1]]);
+  const top = Math.max(...both, 1);
+  const sp = el('div', {}, [spark(hist[histKeys[0]], 0, top), spark(hist[histKeys[1]], 0, top)]);
+  const loadCls = load.cpus && load.load1 / load.cpus > 1.5 ? 'bad' : load.cpus && load.load1 / load.cpus > 0.8 ? 'warn' : '';
+  const c = el('div', { class: 'card wide' }, [
+    el('div', { class: 'k', text: name + ' · ' + sub }),
+    el('div', { class: 'v ' + loadCls, text: '↑ ' + bps(nic.tx_bps) }),
+    rows, sp,
+    el('div', { class: 's', text: 'upper line: upload · lower line: download' }),
+  ]);
+  return c;
+}
+
+function renderNodes(data) {
+  const cards = $('node-cards');
+  cards.textContent = '';
+  const o = (data.nodes || {}).origin;
+  const c = (data.nodes || {}).cn;
+  cards.appendChild(nodeCard('VPS origin', 'encoder in, Cloudflare + tunnel out', o, o ? [
+    'encoder → origin   ' + bps(o.app.ingest_bps),
+    'origin → Cloudflare   ' + bps(o.app.egress_cf_bps),
+    'origin → relay sender   ' + bps(o.app.egress_local_bps),
+  ] : [], ['origin_tx', 'origin_rx']));
+  if (data.servers && data.servers.cn) {
+    cards.appendChild(nodeCard('China node', 'tunnel in, viewers out', c, c ? [
+      'tunnel UDP in   ' + bps(c.app.udp_rx_bps),
+      'viewers HTTP out   ' + bps(c.app.http_tx_bps),
+    ] : [], ['cn_tx', 'cn_rx']));
+  }
+}
+
+function renderTunnel(data) {
+  const cards = $('tunnel-cards');
+  cards.textContent = '';
+  const t = data.tunnel || {};
+  const s = t.sender, r = t.receiver;
+
+  if (s) {
+    const stale = s.age > 5;
+    cards.appendChild(card('Sender → tunnel', bps(s.tx_bps),
+      (stale ? 'STALE · no update for ' + dur(s.age) + ' · ' : '') +
+      'RS(' + s.k + ',' + s.n + ') · ' + Math.round((s.n / s.k - 1) * 100) + '% overhead · ' +
+      s.peers + ' receiver' + (s.peers === 1 ? '' : 's'), stale ? 'bad' : ''));
+    const st = s.stats || {};
+    cards.appendChild(card('Sender totals', String(s.segments_sent),
+      'segments · ' + (st.shards_sent || 0) + ' shards · ' + bytes(st.bytes_sent || 0) + ' · ' +
+      (st.send_error || 0) + ' send errors · ' + (st.playlist_error || 0) + ' playlist errors',
+      (st.send_error || 0) > 0 ? 'warn' : ''));
+  } else {
+    cards.appendChild(card('Sender', 'no data', 'relay-sender.json not found — is the sender updated?', 'warn'));
+  }
+
+  if (!r) {
+    cards.appendChild(card('Receiver', 'no data', 'China node unreachable', 'bad'));
+    return;
+  }
+  const lossCls = r.loss_pct == null ? '' : r.loss_pct > 27 ? 'bad' : r.loss_pct > 20 ? 'warn' : 'ok';
+  push(hist.tunnel_loss, r.loss_pct);
+  cards.appendChild(card('Packet loss', pct(r.loss_pct),
+    'shards lost over the last ' + r.segments_judged + ' segments', lossCls,
+    spark((r.history || []).map((h) => h.loss * 100), 0, Math.max(40, ...((r.history || []).map((h) => h.loss * 100))))));
+  const hr = r.headroom;
+  const hrCls = hr == null ? '' : hr < 8 ? 'bad' : hr < 16 ? 'warn' : 'ok';
+  cards.appendChild(card('FEC headroom', hr == null ? '—' : String(hr),
+    'of ' + r.parity + ' parity shards; worst block lost ' + r.worst_block_lost, hrCls,
+    spark((r.history || []).map((h) => r.parity - h.worst), 0, r.parity || 40)));
+  const rc = r.recovery_ms || {};
+  cards.appendChild(card('Segment recovery', rc.p95 == null ? '—' : rc.p95 + ' ms',
+    'p95 · median ' + (rc.p50 == null ? '—' : rc.p50) + ' ms · max ' + (rc.max == null ? '—' : rc.max) + ' ms', '',
+    spark((r.history || []).map((h) => h.ms), 0)));
+  cards.appendChild(card('Receiver ← tunnel', bps(r.rx_bps),
+    Math.round(r.rx_pps) + ' packets/s' + (s && s.tx_bps ? ' · ' + Math.round(100 * r.rx_bps / s.tx_bps) + '% of what is sent' : '')));
+  const failCls = r.segments_failed_pct > 1 ? 'bad' : r.segments_failed_pct > 0 ? 'warn' : 'ok';
+  cards.appendChild(card('Segments failed', pct(r.segments_failed_pct),
+    r.segments_ok + ' recovered · ' + r.segments_abandoned + ' abandoned (since start)', failCls));
+  const rate = r.blocks_ok ? (100 * r.blocks_recovered / r.blocks_ok) : 0;
+  cards.appendChild(card('Saved by parity', pct(rate),
+    r.blocks_recovered + ' of ' + r.blocks_ok + ' blocks needed it · ' + r.data_shards_recovered + ' shards rebuilt'));
+  const idle = r.since_last_packet;
+  cards.appendChild(card('Last packet', idle == null ? '—' : idle.toFixed(1) + ' s ago',
+    'receiver up ' + dur(r.uptime), idle != null && idle > 5 ? 'bad' : ''));
+}
+
+function renderRows(data) {
+  const onlyActive = $('only-active').checked;
+  const hideInternal = $('hide-internal').checked;
+  const now = performance.now();
+  const body = $('rows');
+  body.textContent = '';
+  let shown = 0;
+  const all = (data.viewers || []).slice().sort((a, b) => a.seen_ago - b.seen_ago);
+  for (const v of all) {
+    if (hideInternal && v.internal) continue;
+    if (onlyActive && !v.active) continue;
+    const k = [v.server, v.source, v.via, v.ip, v.ua].join('|');
+    const p = prevBytes.get(k);
+    if (p && v.bytes >= p[0] && now > p[1]) {
+      rateOf.set(k, (v.bytes - p[0]) * 8 / ((now - p[1]) / 1000));
+    }
+    prevBytes.set(k, [v.bytes, now]);
+    const e = entry(v);
+    const region = v.source === 'cloudflare'
+      ? [v.country, v.colo ? 'edge ' + v.colo : ''].filter(Boolean).join(' · ')
+      : '';
+    const tr = el('tr', { class: v.active ? '' : 'idle' }, [
+      el('td', {}, [el('span', { class: 'badge ' + e.cls, text: e.text })]),
+      el('td', { text: v.ip }),
+      el('td', { text: region || '—' }),
+      el('td', { class: 'ua', title: v.ua, text: uaLabel(v.ua) }),
+      el('td', { text: v.stream || '—' }),
+      el('td', { class: 'num', text: v.seen_ago < 1 ? 'now' : dur(v.seen_ago) + ' ago' }),
+      el('td', { class: 'num', text: dur(v.watched_for) }),
+      el('td', { class: 'num', text: String(v.playlists) }),
+      el('td', { class: 'num', text: String(v.segments) }),
+      el('td', { class: 'num', text: rateOf.has(k) && v.active ? bps(rateOf.get(k)) : '—' }),
+      el('td', { class: 'num', text: bytes(v.bytes) }),
+    ]);
+    body.appendChild(tr);
+    shown++;
+  }
+  if (!shown) {
+    const td = el('td', { colspan: '11', text: 'No viewers match.' });
+    td.style.textAlign = 'center'; td.style.color = 'var(--mut)';
+    body.appendChild(el('tr', {}, [td]));
+  }
+  const internal = all.filter((v) => v.internal).length;
+  $('count').textContent = shown + ' shown' + (internal ? ' · ' + internal + ' internal hidden' : '');
+  // Forget rates for rows that have disappeared, so the maps stay bounded.
+  const live = new Set(all.map((v) => [v.server, v.source, v.via, v.ip, v.ua].join('|')));
+  for (const k of [...prevBytes.keys()]) if (!live.has(k)) { prevBytes.delete(k); rateOf.delete(k); }
+}
+
+let last = null;
+function render(data) {
+  last = data;
+  const s = data.servers || {};
+  $('d-origin').className = 'dot ' + (s.origin && s.origin.ok ? 'ok' : 'bad');
+  $('t-origin').textContent = 'origin';
+  if (s.cn) {
+    $('d-cn').className = 'dot ' + (s.cn.ok ? 'ok' : 'bad');
+    $('t-cn').textContent = 'China node' + (s.cn.ok ? '' : ' · ' + (s.cn.error || 'unreachable'));
+  } else {
+    $('d-cn').className = 'dot warn';
+    $('t-cn').textContent = 'China node · not configured';
+  }
+  $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  renderViewers(data);
+  renderNodes(data);
+  renderTunnel(data);
+  renderRows(data);
+}
+
+/* ---------- polling and sign-in ---------- */
+async function poll() {
+  if (paused) return;
+  try {
+    const res = await fetch('/admin/api/viewers', { headers: { 'X-Admin-Key': key }, cache: 'no-store' });
+    if (res.status === 403) return signOut('Wrong password.');
+    if (res.status === 429) return signOut('Too many attempts. Wait a minute.');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    render(await res.json());
+  } catch (e) {
+    $('updated').textContent = 'update failed: ' + e.message;
+  }
+}
+
+function signIn(k) {
+  key = k;
+  try { sessionStorage.setItem(KEY_STORE, k); } catch (e) { /* private mode */ }
+  $('login').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  poll();
+  clearInterval(timer);
+  timer = setInterval(poll, POLL_MS);
+}
+function signOut(msg) {
+  clearInterval(timer);
+  key = '';
+  try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* ignore */ }
+  $('app').classList.add('hidden');
+  $('login').classList.remove('hidden');
+  $('err').textContent = msg || '';
+  $('pw').value = '';
+  $('pw').focus();
+}
+
+$('go').addEventListener('click', () => { const v = $('pw').value; if (v) signIn(v); });
+$('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('go').click(); });
+$('logout').addEventListener('click', () => signOut(''));
+$('pause').addEventListener('click', () => {
+  paused = !paused;
+  $('pause').textContent = paused ? 'Resume' : 'Pause';
+  if (!paused) poll();
+});
+['only-active', 'hide-internal'].forEach((id) => $(id).addEventListener('change', () => last && renderRows(last)));
+
+try { const saved = sessionStorage.getItem(KEY_STORE); if (saved) signIn(saved); } catch (e) { /* ignore */ }
+</script>
+</body>
+</html>

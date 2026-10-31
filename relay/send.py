@@ -19,6 +19,7 @@ deliberate.
 
 import argparse
 import collections
+import json
 import os
 import re
 import socket
@@ -29,9 +30,13 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "shared"))
 import wire
 from rs import Codec
+from sysstats import RateMeter
 
+TX = RateMeter()    # UDP leaving for the receiver
 PEERS = {}          # addr -> last HELLO time
 PEERS_LOCK = threading.Lock()
 STATS = collections.Counter()
@@ -103,6 +108,8 @@ def send_segment(sock, peers, stream_id, seq, data, k, n, codec, pace):
             try:
                 sock.sendto(pkt, addr)
                 sent += 1
+                STATS["bytes_sent"] += len(pkt)
+                TX.add(len(pkt))
             except OSError:
                 STATS["send_error"] += 1
         if gap:
@@ -126,6 +133,8 @@ def send_manifest(sock, peers, stream_id, gen, body):
             for addr in peers:
                 try:
                     sock.sendto(pkt, addr)
+                    STATS["bytes_sent"] += len(pkt)
+                    TX.add(len(pkt))
                 except OSError:
                     STATS["send_error"] += 1
     STATS["manifests_sent"] += 1
@@ -174,6 +183,30 @@ def rewrite_playlist(body, mapping):
     return ("\n".join(out) + "\n").encode()
 
 
+def write_stats(path, args, next_seq, peers, started):
+    """Publish counters for the admin page.
+
+    A file rather than a socket: the origin runs on the same host, and the
+    sender must not grow a listener just to be read. Written atomically so a
+    reader never sees half of it.
+    """
+    pps, bps = TX.rate()
+    doc = {
+        "t": time.time(), "started": started,
+        "k": args.k, "n": args.n, "pace": args.pace,
+        "peers": len(peers), "segments_sent": next_seq,
+        "tx_pps": round(pps, 1), "tx_bps": round(bps),
+        "stats": dict(STATS),
+    }
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(doc, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def segment_stamp(directory, name):
     """Identify which write of a segment name this is.
 
@@ -206,6 +239,9 @@ def main():
                     help="where to read the continuous playlist from; the "
                          "local relay, not the public hostname")
     ap.add_argument("--peer-ttl", type=float, default=15.0)
+    ap.add_argument("--stats-file", default="",
+                    help="where to publish counters for the admin page "
+                         "(default: <root>/relay-sender.json)")
     ap.add_argument("--pace", type=float, default=0.25,
                     help="seconds to spread one segment's shards over; "
                          "smoothing the burst avoids queue drops")
@@ -215,6 +251,9 @@ def main():
         sys.exit("need 0 < k < n <= 255")
 
     codec = Codec(args.k, args.n)
+    stats_path = args.stats_file or str(Path(args.root) / "relay-sender.json")
+    started = time.time()
+    last_stats = 0.0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
     sock.bind(("0.0.0.0", args.port))
@@ -251,6 +290,9 @@ def main():
 
     while True:
         peers = live_peers(args.peer_ttl)
+        if time.time() - last_stats >= 1.0:
+            write_stats(stats_path, args, next_seq, peers, started)
+            last_stats = time.time()
         if not peers:
             time.sleep(0.5)
             continue

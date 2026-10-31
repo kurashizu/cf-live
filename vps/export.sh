@@ -42,6 +42,10 @@ echo "==> OBS overlay"
 cp overlay/overlay.html vps/overlay.html
 echo "    vps/overlay.html $(wc -c < vps/overlay.html | tr -d ' ') bytes"
 
+echo "==> admin page"
+cp admin/admin.html vps/admin.html
+echo "    vps/admin.html $(wc -c < vps/admin.html | tr -d ' ') bytes"
+
 echo
 echo "copy vps/ to the server, then:"
 echo "  sudo ./install.sh <ingest-key>"

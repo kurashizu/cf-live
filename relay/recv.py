@@ -21,6 +21,9 @@ waiting for it would stall the stream.
 
 import argparse
 import collections
+import hashlib
+import hmac
+import json
 import math
 import os
 import socket
@@ -43,20 +46,32 @@ except ImportError:
         daemon_threads = True
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Shared with the origin; a deploy copies viewers.py and sysstats.py alongside.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "shared"))
 import wire
 from page import PAGE
 from rs import Codec
+from sysstats import NetMeter, RateMeter, host_load
+from viewers import FailureLimiter, ViewerLog
 
 M3U8 = "application/vnd.apple.mpegurl"
 TS_TYPE = "video/MP2T"
 
-CONFIG = {"window": 3}
+CONFIG = {"window": 3, "admin_hash": "", "admin_via": "https-9999"}
+
+VIEWERS = ViewerLog()
+ADMIN_FAILS = FailureLimiter()
+NET = NetMeter()
 
 # Offset applied to the published media sequence so it never decreases, even
 # when the sender restarts and renumbers from zero.
 SEQ_GUARD = {"offset": 0, "last_in": -1, "last_out": -1}
 
 STATE = {
+    "rate": RateMeter(),        # UDP arriving from the sender
+    "http_tx": RateMeter(),     # HTTP leaving to viewers
+    "asm": None,
     "segments": collections.OrderedDict(),  # name -> bytes
     "playlist": b"",
     "lock": threading.Lock(),
@@ -83,6 +98,12 @@ class Reassembler(object):
         self.keep = keep_segments
         self.codecs = {}
         self.log = log
+        # Per-segment link accounting, kept apart from the decode state so
+        # that shards arriving after a segment completes still count. Loss is
+        # only meaningful over a whole segment, and a segment is judged once
+        # it has fallen out of the live window, when nothing more can arrive.
+        self.acct = {}
+        self.history = collections.deque(maxlen=120)
 
     def codec(self, k, n):
         key = (k, n)
@@ -103,6 +124,16 @@ class Reassembler(object):
         total = p.get("blocks")
         if total:
             self.expected[seq] = total
+        a = self.acct.get(seq)
+        if a is None:
+            a = self.acct[seq] = {"rx": 0, "exp": 0, "blocks": 0, "k": k,
+                                  "n": n, "first": time.time(), "done": None,
+                                  "blk": {}}
+        a["rx"] += 1
+        if total:
+            a["exp"] = total * n
+            a["blocks"] = total
+        a["blk"][blk] = a["blk"].get(blk, 0) + 1
         key = (seq, blk)
         rec = self.blocks.get(key)
         if rec is None:
@@ -119,7 +150,9 @@ class Reassembler(object):
         have = sum(1 for s in rec["shards"] if s is not None)
         if have < k:
             return None
-        # Enough shards: recover the block.
+        # Enough shards: recover the block. A block that arrived with every
+        # data shard needed no parity; one missing some was saved by it.
+        missing = sum(1 for sh in rec["shards"][:k] if sh is None)
         try:
             data = self.codec(k, n).decode(rec["shards"])
         except ValueError:
@@ -131,6 +164,9 @@ class Reassembler(object):
         rec["shards"] = None          # free the shards immediately
         blob = b"".join(data)[:rec["len"]]
         STATE["stats"]["blocks_ok"] += 1
+        if missing:
+            STATE["stats"]["blocks_recovered"] += 1
+            STATE["stats"]["data_shards_recovered"] += missing
         self.segments.setdefault(seq, {})[blk] = blob
         return self.try_complete(seq)
 
@@ -148,6 +184,9 @@ class Reassembler(object):
         if any(i not in parts for i in range(total)):
             return None
         body = b"".join(parts[i] for i in range(total))
+        a = self.acct.get(seq)
+        if a is not None and a["done"] is None:
+            a["done"] = time.time() - a["first"]
         self.cleanup(seq)
         self.done[seq] = True
         while len(self.done) > self.keep * 4:
@@ -160,8 +199,26 @@ class Reassembler(object):
         for key in [k for k in self.blocks if k[0] == seq]:
             self.blocks.pop(key, None)
 
+    def finalize(self, below_seq):
+        """Judge segments that have left the window: nothing more can arrive."""
+        for seq in [s for s in list(self.acct) if s < below_seq]:
+            a = self.acct.pop(seq)
+            if not a["exp"]:
+                continue
+            worst = max((a["n"] - a["blk"].get(b, 0)
+                         for b in range(a["blocks"])), default=0)
+            self.history.append({
+                "rx": a["rx"], "exp": a["exp"],
+                "loss": round(1.0 - a["rx"] / float(a["exp"]), 4),
+                "worst_lost": worst, "parity": a["n"] - a["k"],
+                "recovery_ms": (round(a["done"] * 1000)
+                                if a["done"] is not None else None),
+                "ok": a["done"] is not None,
+            })
+
     def expire(self, below_seq):
         """Abandon segments older than the live window."""
+        self.finalize(below_seq)
         for seq in [s for s in list(self.segments) if s < below_seq]:
             STATE["stats"]["segments_abandoned"] += 1
             self.cleanup(seq)
@@ -172,6 +229,7 @@ class Reassembler(object):
 def receiver_loop(args):
     codec_log = []
     asm = Reassembler(args.keep, codec_log)
+    STATE["asm"] = asm
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     sock.bind(("0.0.0.0", args.local_port))
@@ -211,6 +269,7 @@ def receiver_loop(args):
             continue
         STATE["last_packet"] = now
         STATE["stats"]["packets"] += 1
+        STATE["rate"].add(len(buf), now)
 
         if ptype == wire.SHARD:
             p = wire.unpack_shard(buf, off)
@@ -218,6 +277,11 @@ def receiver_loop(args):
                 continue
             if p["seq"] > highest_seq:
                 highest_seq = p["seq"]
+                # A segment's shards all land within a second or so, so four
+                # segments on it is settled: judge its loss now rather than
+                # when it finally leaves the window, which would leave the
+                # admin page empty for the first half-minute of a broadcast.
+                asm.finalize(highest_seq - 4)
                 asm.expire(highest_seq - args.keep * 2)
             out = asm.add_shard(p)
             if out:
@@ -365,6 +429,52 @@ def available_playlist(body, have, window=0):
     return ("\n".join(out) + "\n").encode()
 
 
+def _pct(values, p):
+    values = sorted(values)
+    return values[min(len(values) - 1, int(len(values) * p))] if values else None
+
+
+def tunnel_overview():
+    """How the FEC tunnel is doing, measured where it can be: here.
+
+    The sender has no feedback channel, so only the receiving end knows how
+    many shards actually arrived. Everything is over the last 60 judged
+    segments, which is about a minute of broadcast.
+    """
+    asm = STATE["asm"]
+    hist = list(asm.history)[-60:] if asm else []
+    rx = sum(h["rx"] for h in hist)
+    exp = sum(h["exp"] for h in hist)
+    parity = hist[-1]["parity"] if hist else 0
+    worst = max((h["worst_lost"] for h in hist), default=0)
+    rec = [h["recovery_ms"] for h in hist if h["recovery_ms"] is not None]
+    st = STATE["stats"]
+    pps, bps = STATE["rate"].rate()
+    age = time.time() - STATE["last_packet"] if STATE["last_packet"] else None
+    return {
+        "since_last_packet": None if age is None else round(age, 2),
+        "uptime": round(time.time() - STATE["started"]),
+        "rx_pps": round(pps, 1), "rx_bps": round(bps),
+        "segments_judged": len(hist),
+        "loss_pct": round(100.0 * (1 - rx / float(exp)), 2) if exp else None,
+        # Parity shards per block minus the most any one block lost: how many
+        # more could have gone missing before a segment failed to decode.
+        "parity": parity, "worst_block_lost": worst,
+        "headroom": (parity - worst) if hist else None,
+        "recovery_ms": {"p50": _pct(rec, 0.5), "p95": _pct(rec, 0.95),
+                        "max": max(rec) if rec else None},
+        "segments_ok": st["segments_ok"],
+        "segments_abandoned": st["segments_abandoned"],
+        "segments_failed_pct": round(
+            100.0 * sum(1 for h in hist if not h["ok"]) / len(hist), 2) if hist else None,
+        "blocks_ok": st["blocks_ok"],
+        "blocks_recovered": st["blocks_recovered"],
+        "data_shards_recovered": st["data_shards_recovered"],
+        "history": [{"loss": h["loss"], "worst": h["worst_lost"],
+                     "ms": h["recovery_ms"], "ok": h["ok"]} for h in hist],
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -380,6 +490,53 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+            STATE["http_tx"].add(len(body))
+        track = getattr(self, "_track", None)
+        if track:
+            self._track = None
+            VIEWERS.record(self.client_ip(), self.headers.get("User-Agent", ""),
+                           "cn", self.headers.get("X-Krsz-Via") or "direct",
+                           track[1], track[0],
+                           0 if self.command == "HEAD" else len(body))
+
+    def client_ip(self):
+        """The viewer's address. Both fronts (nginx, tlsproxy) overwrite
+        X-Real-IP with the peer they saw, and this port is loopback only, so
+        the header cannot be forged by a viewer."""
+        return self.headers.get("X-Real-IP") or self.client_address[0]
+
+    def admin_overview(self):
+        h = CONFIG["admin_hash"]
+        if not h:
+            self.fail(404)
+            return
+        # Over TLS only. The key rides in a header and must never cross the
+        # open internet; tlsproxy stamps this and nginx overwrites any claim.
+        if self.headers.get("X-Krsz-Via") != CONFIG["admin_via"]:
+            self.fail(403, "admin is https only\n")
+            return
+        who = self.client_ip()
+        if ADMIN_FAILS.blocked(who):
+            self.fail(429, "too many attempts\n")
+            return
+        given = hashlib.sha256(
+            (self.headers.get("X-Admin-Key") or "").encode()).hexdigest()
+        if not hmac.compare_digest(given, h):
+            ADMIN_FAILS.fail(who)
+            time.sleep(0.4)
+            self.fail(403, "forbidden\n")
+            return
+        net = NET.rates()
+        _pps, http_bps = STATE["http_tx"].rate()
+        pps, udp_bps = STATE["rate"].rate()
+        body = json.dumps({
+            "viewers": VIEWERS.snapshot(),
+            "tunnel": tunnel_overview(),
+            "node": {"nic": net, "load": host_load(),
+                     "app": {"udp_rx_bps": round(udp_bps),
+                             "http_tx_bps": round(http_bps)}},
+        }).encode()
+        self.send_payload(body, "application/json", "no-store")
 
     def fail(self, code, text="not found\n"):
         b = text.encode()
@@ -396,6 +553,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        self._track = None      # a kept-alive connection reuses this object
+
+        if path == "/admin/overview":
+            self.admin_overview()
+            return
 
         if path in ("/healthz", "/health"):
             self.send_payload(b"ok\n", "text/plain", "no-store")
@@ -437,6 +599,7 @@ class Handler(BaseHTTPRequestHandler):
             if body is None:
                 self.fail(503, "no fragments recovered yet\n")
                 return
+            self._track = ("playlist", "main")
             self.send_payload(body, M3U8, "no-store")
             return
 
@@ -448,6 +611,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.fail(404)
                 return
             # Segments are immutable once recovered.
+            self._track = ("segment", "main")
             self.send_payload(body, TS_TYPE, "public, max-age=30")
             return
 
@@ -470,9 +634,20 @@ def main():
     ap.add_argument("--hello-interval", type=float, default=2.0,
                     help="pinhole refresh; must stay below the security "
                          "group's UDP idle timeout")
+    ap.add_argument("--admin-key-sha256", default="",
+                    help="SHA-256 of the admin password, hex. Only the hash "
+                         "is kept here, so this box never holds the ingest "
+                         "key itself; empty disables the admin API")
+    ap.add_argument("--admin-via", default="https-9999",
+                    help="the X-Krsz-Via value that tlsproxy stamps; the admin "
+                         "API answers only requests carrying it (tlsproxy names "
+                         "it https-<its listen port>)")
     args = ap.parse_args()
 
     CONFIG["window"] = args.window
+    CONFIG["admin_via"] = args.admin_via
+    CONFIG["admin_hash"] = args.admin_key_sha256.strip().lower()
+    NET.start()
 
     t = threading.Thread(target=receiver_loop, args=(args,), daemon=True)
     t.start()

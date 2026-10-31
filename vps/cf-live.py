@@ -16,6 +16,9 @@ then deleted. Disk would only add wear.
 
 import argparse
 import hashlib
+import json
+import time
+import urllib.request
 import math
 import hmac
 import os
@@ -37,6 +40,20 @@ except ImportError:
         daemon_threads = True
 from pathlib import Path
 
+# The viewer log is shared with the China relay, so it lives one directory up
+# in the repo; the deploy copies it next to this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
+from sysstats import NetMeter, RateMeter, host_load  # noqa: E402
+from viewers import FailureLimiter, ViewerLog  # noqa: E402
+
+VIEWERS = ViewerLog()
+ADMIN_FAILS = FailureLimiter()
+NET = NetMeter()
+INGEST = RateMeter()          # the encoder pushing in
+EGRESS_CF = RateMeter()       # responses to Cloudflare (its cache misses)
+EGRESS_LOCAL = RateMeter()    # responses to the relay sender on this host
+
 # Names that must never be treated as a stream, or a stream could shadow an
 # endpoint.
 RESERVED = {
@@ -48,6 +65,8 @@ RESERVED = {
     # The OBS overlay page, which would otherwise be shadowed by a stream
     # that happened to be called "overlay".
     "overlay", "overlay.html",
+    # The admin page and its API.
+    "admin",
 }
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -203,6 +222,50 @@ def stream_dir(stream: str) -> Path:
     return Path(CONFIG["root"]) / stream
 
 
+_CN_CACHE = {"at": 0.0, "result": None}
+_CN_LOCK = threading.Lock()
+
+
+def read_sender_stats():
+    """The relay sender's counters, which it publishes as a file each second.
+
+    `age` lets the page say the sender has gone quiet instead of presenting
+    a frozen reading as current.
+    """
+    try:
+        doc = json.loads((Path(CONFIG["root"]) / "relay-sender.json").read_text())
+    except (OSError, ValueError):
+        return None
+    doc["age"] = round(time.time() - doc.get("t", 0), 1)
+    return doc
+
+
+def fetch_cn_viewers(url: str, key: str) -> dict:
+    """Ask the China relay who is on it.
+
+    Held for 1.5 s so an admin page polling every 2 s (or several of them)
+    costs the relay at most one request per poll, over a link that is slow
+    and lossy. The relay only answers over HTTPS, so the key is never sent in
+    the clear, and it stores only a hash of it.
+    """
+    with _CN_LOCK:
+        now = time.time()
+        if _CN_CACHE["result"] is not None and now - _CN_CACHE["at"] < 1.5:
+            return _CN_CACHE["result"]
+        try:
+            req = urllib.request.Request(url, headers={
+                "X-Admin-Key": key, "User-Agent": "krsz-admin/1"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                data = json.loads(r.read().decode())
+            result = {"ok": True, "viewers": data.get("viewers", []),
+                      "tunnel": data.get("tunnel"), "node": data.get("node")}
+        except Exception as exc:
+            result = {"ok": False, "viewers": [],
+                      "error": type(exc).__name__}
+        _CN_CACHE.update(at=time.time(), result=result)
+        return result
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -228,6 +291,44 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+        if self.command != "HEAD" and not self.path.startswith("/admin"):
+            (EGRESS_LOCAL if self.client_info()["internal"]
+             else EGRESS_CF).add(len(body))
+        track = getattr(self, "_track", None)
+        if track and status == 200:
+            self._track = None
+            self.record_viewer(track, 0 if self.command == "HEAD" else len(body))
+
+    # ---- viewers ---------------------------------------------------------
+    def client_info(self):
+        """Who is asking, and which way in.
+
+        This process binds loopback and the only route in from outside is the
+        Cloudflare tunnel, so Cloudflare's own headers can be trusted here:
+        nobody else can reach this port to forge them. A request from
+        loopback with none of them is the relay sender polling, not a viewer.
+        """
+        h = self.headers
+        cf_ip = (h.get("CF-Connecting-IP") or "").strip()
+        if cf_ip:
+            ray = h.get("CF-Ray") or ""
+            return {"ip": cf_ip, "source": "cloudflare", "via": "cloudflare",
+                    "country": h.get("CF-IPCountry") or "",
+                    "colo": ray.rsplit("-", 1)[-1] if "-" in ray else "",
+                    "internal": False}
+        peer = self.client_address[0]
+        internal = peer in ("127.0.0.1", "::1")
+        return {"ip": peer, "source": "local" if internal else "direct",
+                "via": "loopback" if internal else "direct",
+                "country": "", "colo": "", "internal": internal}
+
+    def record_viewer(self, track, nbytes):
+        kind, stream = track
+        c = self.client_info()
+        VIEWERS.record(c["ip"], self.headers.get("User-Agent", ""),
+                       c["source"], c["via"], stream, kind, nbytes,
+                       country=c["country"], colo=c["colo"],
+                       internal=c["internal"])
 
     def send_text(self, text: str, status: int = 200):
         self.send_body(text.encode(), "text/plain; charset=utf-8", "no-store", status)
@@ -249,6 +350,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         path = self.path.split("?", 1)[0]
+        self._track = None      # a kept-alive connection reuses this object
+
+        if path == "/admin":
+            # Static; the password is asked for in the page and only ever
+            # sent as a header to the API below.
+            self.send_file(Path(CONFIG["www"]) / "admin.html",
+                           "text/html; charset=utf-8", "no-store")
+            return
+        if path == "/admin/api/viewers":
+            self.serve_admin_viewers()
+            return
 
         if path in ("/healthz", "/health"):
             self.send_text("ok\n")
@@ -277,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
         # copy (that bug cost hours once already).
         m = re.match(r"^/live/_offline(?:\.([0-9a-f]{8}))?(?:\.(\d+))?\.ts$", path)
         if m:
+            self._track = ("segment", "(offline)")
             fresh = m.group(1) == CONFIG.get("slate_version")
             position = int(m.group(2)) if m.group(2) is not None else None
             try:
@@ -304,12 +417,14 @@ class Handler(BaseHTTPRequestHandler):
         # /live/<stream>/index.m3u8 — the media playlist.
         m = re.match(r"^/live/([^/]+)/index\.m3u8$", path)
         if m and safe(m.group(1)):
+            self._track = ("playlist", m.group(1))
             self.serve_media_playlist(m.group(1))
             return
 
         # /live/<stream>/<file> — a segment.
         m = re.match(r"^/live/([^/]+)/([^/]+)$", path)
         if m and safe(m.group(1)) and safe(m.group(2)):
+            self._track = ("segment", m.group(1))
             self.serve_segment(m.group(1), m.group(2))
             return
 
@@ -328,10 +443,51 @@ class Handler(BaseHTTPRequestHandler):
             # meant for something else, not a stream called "x.mpd".
             if (name.lower() not in RESERVED and safe(name)
                     and not (m.group(2) is None and re.search(r"\.[A-Za-z0-9]+$", name))):
+                self._track = ("playlist", name)
                 self.serve_master(name)
                 return
 
         self.send_text("not found\n", 404)
+
+    # ---- admin -----------------------------------------------------------
+    def serve_admin_viewers(self):
+        """Every viewer on every entry point, for the admin page.
+
+        The password is the ingest key. It travels as a header, never in the
+        URL, and repeated misses lock the client out for a minute.
+        """
+        who = self.client_info()["ip"]
+        if ADMIN_FAILS.blocked(who):
+            self.send_text("too many attempts\n", 429)
+            return
+        given = (self.headers.get("X-Admin-Key") or "").encode()
+        if not hmac.compare_digest(given, CONFIG["key"].encode()):
+            ADMIN_FAILS.fail(who)
+            time.sleep(0.4)              # blunt a guessing loop
+            self.send_text("forbidden\n", 403)
+            return
+
+        viewers = [dict(v, server="origin") for v in VIEWERS.snapshot()]
+        servers = {"origin": {"ok": True}}
+        _, ingest_bps = INGEST.rate()
+        _, cf_bps = EGRESS_CF.rate()
+        _, local_bps = EGRESS_LOCAL.rate()
+        nodes = {"origin": {
+            "nic": NET.rates(), "load": host_load(),
+            "app": {"ingest_bps": round(ingest_bps),
+                    "egress_cf_bps": round(cf_bps),
+                    "egress_local_bps": round(local_bps)}}}
+        tunnel = {"sender": read_sender_stats(), "receiver": None}
+        cn_url = CONFIG.get("cn_admin_url")
+        if cn_url:
+            cn = fetch_cn_viewers(cn_url, given.decode())
+            servers["cn"] = {"ok": cn["ok"], "error": cn.get("error", "")}
+            viewers += [dict(v, server="cn") for v in cn.get("viewers", [])]
+            nodes["cn"] = cn.get("node")
+            tunnel["receiver"] = cn.get("tunnel")
+        body = json.dumps({"servers": servers, "viewers": viewers,
+                           "nodes": nodes, "tunnel": tunnel}).encode()
+        self.send_body(body, "application/json", "no-store")
 
     # ---- playback --------------------------------------------------------
     def serve_master(self, stream: str):
@@ -801,6 +957,7 @@ class Handler(BaseHTTPRequestHandler):
         if not data:
             self.send_text("empty\n", 400)
             return
+        INGEST.add(len(data))
         target.parent.mkdir(parents=True, exist_ok=True)
         # Write to a temporary name and rename into place, so a player never
         # reads a half-written segment.
@@ -992,6 +1149,9 @@ def main():
     ap.add_argument("--stale-after", type=float, default=1.0,
                     help="serve the offline slate once ingest has been idle "
                          "this many seconds (0 disables)")
+    ap.add_argument("--cn-admin-url", default="",
+                    help="the China relay's /admin/overview URL (HTTPS), "
+                         "merged into the admin page; empty disables")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -1017,6 +1177,7 @@ def main():
         CONFIG["slate_version"] = "00000000"
         print(f"  WARNING: no slate at {slate}", flush=True)
 
+    NET.start()
     if args.reap_after > 0:
         threading.Thread(
             target=reap_stale, args=(Path(args.root), args.reap_after),

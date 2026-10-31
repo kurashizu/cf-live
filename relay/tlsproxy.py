@@ -71,9 +71,17 @@ class Proxy(socketserver.StreamRequestHandler):
         if n and n.isdigit():
             body = self.rfile.read(int(n))
 
+        # Identity headers are set here, never passed through: a viewer could
+        # otherwise claim any address, or claim to have arrived over HTTPS,
+        # which is what the relay's admin API trusts to decide the password
+        # never crossed a cleartext hop.
+        spoofable = {"x-real-ip", "x-forwarded-for", "x-krsz-via"}
         fwd = {k: v for k, v in headers.items()
-               if k.lower() not in HOP_BY_HOP and k.lower() != "host"}
+               if k.lower() not in HOP_BY_HOP and k.lower() != "host"
+               and k.lower() not in spoofable}
         fwd["Host"] = self.server.origin_host
+        fwd["X-Real-IP"] = self.client_address[0]
+        fwd["X-Krsz-Via"] = self.server.via
 
         try:
             conn = HTTPConnection(self.server.origin_host,
@@ -167,6 +175,8 @@ def main():
 
     srv = Server((lh, int(lp)), Proxy)
     srv.origin_host, srv.origin_port = oh, int(op)
+    # Named for the port so the relay can tell this entry from nginx's.
+    srv.via = "https-%s" % lp
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)

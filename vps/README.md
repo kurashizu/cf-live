@@ -201,3 +201,37 @@ They can coexist: the Worker on `workers.dev` or a second hostname, the VPS on
 the main one. The Worker version works and stays within the free tier for a
 couple of hours a day with a handful of viewers — worth keeping as a fallback
 while the VPS setup proves itself.
+
+## Admin page
+
+`https://<host>/admin` shows who is watching and how the delivery path is
+doing, live (2 s refresh). The password is the ingest key.
+
+- **Viewers**: every client with its address, the way in (Cloudflare with
+  its country and edge colo, the China node over HTTP or HTTPS, or direct),
+  player, time watching, playlist/segment counts and a per-viewer rate. The
+  relay sender's own polling is hidden as "internal". Presence is judged by
+  playlist polls, because Cloudflare caches segments.
+- **Nodes**: interface throughput from `/proc/net/dev` plus load and memory
+  on each box, and what the app itself moved (encoder in, Cloudflare out,
+  tunnel out / in, viewers out). Cloudflare's own edge traffic is not visible.
+- **FEC tunnel**: loss, FEC headroom, segment recovery time and failures,
+  measured at the receiver, plus the sender's rate and counters.
+
+Needs `cf-live.py` (not the nginx setup) and, for the China node's half:
+
+```sh
+# on the VPS: the China relay's admin URL, which answers over HTTPS only
+cf-live.py ... --cn-admin-url https://cn.live.krsz.in:9999/admin/overview
+
+# on the China box: only a hash of the key is stored there
+recv.py ... --admin-key-sha256 "$(printf %s "$KEY" | sha256sum | cut -d' ' -f1)"
+```
+
+`shared/viewers.py` and `shared/sysstats.py` must sit next to `cf-live.py`,
+`send.py` and `recv.py` on each box. The sender publishes its counters to
+`<root>/relay-sender.json` once a second for the origin to read.
+
+Everything shown from the network is rendered as text, never as HTML, and
+five wrong passwords a minute lock a client out.
+
